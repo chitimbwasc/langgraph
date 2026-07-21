@@ -1,39 +1,68 @@
-.PHONY: lint-docs format-docs build-docs serve-docs serve-clean-docs clean-docs codespell build-typedoc
+# Define the directories containing projects
+LIBS_DIRS := $(wildcard libs/*)
 
-build-typedoc:
-	cd libs/sdk-js && yarn install --include-dev && yarn typedoc
-	cd libs/sdk-js && yarn --silent concat-md --decrease-title-levels --ignore=js_ts_sdk_ref.md --start-title-level-at 2 docs > ../../docs/docs/cloud/reference/sdk/js_ts_sdk_ref.md 2>/dev/null
-	#  Add links to the monorepo
-	sed -e '1,10s|@langchain/langgraph-sdk|[@langchain/langgraph-sdk](https://github.com/langchain-ai/langgraph/tree/main/libs/sdk-js)|g' docs/docs/cloud/reference/sdk/js_ts_sdk_ref.md > temp_file && mv temp_file docs/docs/cloud/reference/sdk/js_ts_sdk_ref.md
+# Default target
+.PHONY: all
+all: lint format lock test
 
-build-docs: build-typedoc
-	poetry run python -m mkdocs build --clean -f docs/mkdocs.yml --strict
+# Install dependencies for all projects
+.PHONY: install
+install:
+	@echo "Creating virtual environment..."
+	@uv venv
+	@for dir in $(LIBS_DIRS); do \
+		if [ -f $$dir/pyproject.toml ]; then \
+			echo "Installing dependencies for $$dir"; \
+			uv pip install -e $$dir; \
+		fi; \
+	done
 
-serve-clean-docs: clean-docs
-	poetry run python -m mkdocs serve -c -f docs/mkdocs.yml --strict -w ./libs/langgraph
+# Lint all projects
+.PHONY: lint
+lint:
+	@for dir in $(LIBS_DIRS); do \
+		if [ -f $$dir/Makefile ]; then \
+			echo "Running lint in $$dir"; \
+			$(MAKE) -C $$dir lint; \
+		fi; \
+	done
 
-serve-docs: build-typedoc
-	poetry run python -m mkdocs serve -f docs/mkdocs.yml -w ./libs/langgraph  -w ./libs/checkpoint -w ./libs/sdk-py --dirty
+# Format all projects
+.PHONY: format
+format:
+	@for dir in $(LIBS_DIRS); do \
+		if [ -f $$dir/Makefile ]; then \
+			echo "Running format in $$dir"; \
+			$(MAKE) -C $$dir format; \
+		fi; \
+	done
 
-clean-docs:
-	find ./docs/docs -name "*.ipynb" -type f -delete
-	rm -rf docs/site
+# Lock all projects
+.PHONY: lock
+lock:
+	@for dir in $(LIBS_DIRS); do \
+		if [ -f $$dir/Makefile ]; then \
+			echo "Running lock in $$dir"; \
+			(cd $$dir && uv lock); \
+		fi; \
+	done
 
-## Run format against the project documentation.
-format-docs:
-	poetry run ruff format docs/docs
-	poetry run ruff check --fix docs/docs
+# Lock all projects and upgrade dependencies
+.PHONY: lock-upgrade
+lock-upgrade:
+	@for dir in $(LIBS_DIRS); do \
+		if [ -f $$dir/Makefile ]; then \
+			echo "Running lock-upgrade in $$dir"; \
+			(cd $$dir && uv lock --upgrade); \
+		fi; \
+	done
 
-# Check the docs for linting violations
-lint-docs:
-	poetry run ruff format --check docs/docs
-	poetry run ruff check docs/docs
-
-codespell:
-	./docs/codespell_notebooks.sh .
-
-start-services:
-	docker compose -f docs/test-compose.yml up -V --force-recreate --wait --remove-orphans
-
-stop-services:
-	docker compose -f docs/test-compose.yml down
+# Test all projects
+.PHONY: test
+test:
+	@for dir in $(LIBS_DIRS); do \
+		if [ -f $$dir/Makefile ]; then \
+			echo "Running test in $$dir"; \
+			$(MAKE) -C $$dir test; \
+		fi; \
+	done

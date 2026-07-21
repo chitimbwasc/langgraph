@@ -1,21 +1,21 @@
-import asyncio
 import os
 import tempfile
 from collections import defaultdict
 from functools import partial
-from typing import Any, Optional
+from typing import Any
 
 from langchain_core.runnables import RunnableConfig
-
 from langgraph.checkpoint.base import (
+    BaseCheckpointSaver,
     ChannelVersions,
     Checkpoint,
     CheckpointMetadata,
     CheckpointTuple,
     SerializerProtocol,
-    copy_checkpoint,
 )
-from langgraph.checkpoint.memory import MemorySaver, PersistentDict
+from langgraph.checkpoint.memory import InMemorySaver, PersistentDict
+
+from langgraph.constants import TASKS
 
 
 class NoopSerializer(SerializerProtocol):
@@ -26,14 +26,36 @@ class NoopSerializer(SerializerProtocol):
         return "type", obj
 
 
-class MemorySaverAssertImmutable(MemorySaver):
+class MemorySaverNeedsPendingSendsMigration(BaseCheckpointSaver):
+    def __init__(self) -> None:
+        self.saver = InMemorySaver()
+
+    def __getattribute__(self, name):
+        if name in ("saver", "__class__", "get_tuple"):
+            return object.__getattribute__(self, name)
+        return getattr(self.saver, name)
+
+    def get_tuple(self, config):
+        if tup := self.saver.get_tuple(config):
+            if tup.checkpoint["v"] == 4 and tup.checkpoint["channel_values"].get(TASKS):
+                tup.checkpoint["v"] = 3
+                tup.checkpoint["pending_sends"] = tup.checkpoint["channel_values"].pop(
+                    TASKS
+                )
+                tup.checkpoint["channel_versions"].pop(TASKS)
+                for seen in tup.checkpoint["versions_seen"].values():
+                    seen.pop(TASKS, None)
+        return tup
+
+
+class MemorySaverAssertImmutable(InMemorySaver):
     storage_for_copies: defaultdict[str, dict[str, dict[str, Checkpoint]]]
 
     def __init__(
         self,
         *,
-        serde: Optional[SerializerProtocol] = None,
-        put_sleep: Optional[float] = None,
+        serde: SerializerProtocol | None = None,
+        put_sleep: float | None = None,
     ) -> None:
         _, filename = tempfile.mkstemp()
         super().__init__(
@@ -63,71 +85,16 @@ class MemorySaverAssertImmutable(MemorySaver):
                     self.storage_for_copies[thread_id][checkpoint_ns][saved["id"]]
                 )
                 == saved
-            )
+            ), config["configurable"]["checkpoint_ns"]
         self.storage_for_copies[thread_id][checkpoint_ns][checkpoint["id"]] = (
-            self.serde.dumps_typed(copy_checkpoint(checkpoint))
+            self.serde.dumps_typed(checkpoint)
         )
         # call super to write checkpoint
         return super().put(config, checkpoint, metadata, new_versions)
 
 
-class MemorySaverAssertCheckpointMetadata(MemorySaver):
-    """This custom checkpointer is for verifying that a run's configurable
-    fields are merged with the previous checkpoint config for each step in
-    the run. This is the desired behavior. Because the checkpointer's (a)put()
-    method is called for each step, the implementation of this checkpointer
-    should produce a side effect that can be asserted.
-    """
-
-    def put(
-        self,
-        config: RunnableConfig,
-        checkpoint: Checkpoint,
-        metadata: CheckpointMetadata,
-        new_versions: ChannelVersions,
-    ) -> None:
-        """The implementation of put() merges config["configurable"] (a run's
-        configurable fields) with the metadata field. The state of the
-        checkpoint metadata can be asserted to confirm that the run's
-        configurable fields were merged with the previous checkpoint config.
-        """
-        configurable = config["configurable"].copy()
-
-        # remove checkpoint_id to make testing simpler
-        checkpoint_id = configurable.pop("checkpoint_id", None)
-        thread_id = config["configurable"]["thread_id"]
-        checkpoint_ns = config["configurable"]["checkpoint_ns"]
-        self.storage[thread_id][checkpoint_ns].update(
-            {
-                checkpoint["id"]: (
-                    self.serde.dumps_typed(checkpoint),
-                    # merge configurable fields and metadata
-                    self.serde.dumps_typed({**configurable, **metadata}),
-                    checkpoint_id,
-                )
-            }
-        )
-        return {
-            "configurable": {
-                "thread_id": config["configurable"]["thread_id"],
-                "checkpoint_id": checkpoint["id"],
-            }
-        }
-
-    async def aput(
-        self,
-        config: RunnableConfig,
-        checkpoint: Checkpoint,
-        metadata: CheckpointMetadata,
-        new_versions: ChannelVersions,
-    ) -> RunnableConfig:
-        return await asyncio.get_running_loop().run_in_executor(
-            None, self.put, config, checkpoint, metadata, new_versions
-        )
-
-
-class MemorySaverNoPending(MemorySaver):
-    def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
+class MemorySaverNoPending(InMemorySaver):
+    def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         result = super().get_tuple(config)
         if result:
             return CheckpointTuple(result.config, result.checkpoint, result.metadata)

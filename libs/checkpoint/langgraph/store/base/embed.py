@@ -6,9 +6,13 @@ with LangChain-compatible tools while maintaining support for both synchronous a
 asynchronous operations.
 """
 
+from __future__ import annotations
+
 import asyncio
+import functools
 import json
-from typing import Any, Awaitable, Callable, Optional, Sequence, Union
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Any
 
 from langchain_core.embeddings import Embeddings
 
@@ -28,7 +32,7 @@ Similar to EmbeddingsFunc, but returns an awaitable that resolves to the embeddi
 
 
 def ensure_embeddings(
-    embed: Union[Embeddings, EmbeddingsFunc, AEmbeddingsFunc, None],
+    embed: Embeddings | EmbeddingsFunc | AEmbeddingsFunc | str | None,
 ) -> Embeddings:
     """Ensure that an embedding function conforms to LangChain's Embeddings interface.
 
@@ -45,7 +49,9 @@ def ensure_embeddings(
         An Embeddings instance that wraps the provided function(s).
 
     ??? example "Examples"
+
         Wrap a synchronous embedding function:
+
         ```python
         def my_embed_fn(texts):
             return [[0.1, 0.2] for _ in texts]
@@ -55,6 +61,7 @@ def ensure_embeddings(
         ```
 
         Wrap an asynchronous embedding function:
+
         ```python
         async def my_async_fn(texts):
             return [[0.1, 0.2] for _ in texts]
@@ -62,9 +69,38 @@ def ensure_embeddings(
         embeddings = ensure_embeddings(my_async_fn)
         result = await embeddings.aembed_query("hello")  # Returns [0.1, 0.2]
         ```
+
+        Initialize embeddings using a provider string:
+
+        ```python
+        # Requires langchain>=0.3.9 and langgraph-checkpoint>=2.0.11
+        embeddings = ensure_embeddings("openai:text-embedding-3-small")
+        result = embeddings.embed_query("hello")
+        ```
     """
     if embed is None:
         raise ValueError("embed must be provided")
+    if isinstance(embed, str):
+        init_embeddings = _get_init_embeddings()
+        if init_embeddings is None:
+            from importlib.metadata import PackageNotFoundError, version
+
+            try:
+                lc_version = version("langchain")
+                version_info = f"Found langchain version {lc_version}, but"
+            except PackageNotFoundError:
+                version_info = "langchain is not installed;"
+
+            raise ValueError(
+                f"Could not load embeddings from string '{embed}'. {version_info} "
+                "loading embeddings by provider:identifier string requires langchain>=0.3.9 "
+                "as well as the provider-specific package. "
+                "Install LangChain with: pip install 'langchain>=0.3.9' "
+                "and the provider-specific package (e.g., 'langchain-openai>=0.3.0'). "
+                "Alternatively, specify 'embed' as a compatible Embeddings object or python function."
+            )
+        return init_embeddings(embed)
+
     if isinstance(embed, Embeddings):
         return embed
     return EmbeddingsLambda(embed)
@@ -87,7 +123,9 @@ class EmbeddingsLambda(Embeddings):
             will raise an error. If sync, it will be used for both sync and async operations.
 
     ??? example "Examples"
+
         With a sync function:
+
         ```python
         def my_embed_fn(texts):
             # Return 2D embeddings for each text
@@ -99,6 +137,7 @@ class EmbeddingsLambda(Embeddings):
         ```
 
         With an async function:
+
         ```python
         async def my_async_fn(texts):
             return [[0.1, 0.2] for _ in texts]
@@ -111,7 +150,7 @@ class EmbeddingsLambda(Embeddings):
 
     def __init__(
         self,
-        func: Union[EmbeddingsFunc, AEmbeddingsFunc],
+        func: EmbeddingsFunc | AEmbeddingsFunc,
     ) -> None:
         if func is None:
             raise ValueError("func must be provided")
@@ -191,7 +230,7 @@ class EmbeddingsLambda(Embeddings):
         return (await afunc([text]))[0]
 
 
-def get_text_at_path(obj: Any, path: Union[str, list[str]]) -> list[str]:
+def get_text_at_path(obj: Any, path: str | list[str]) -> list[str]:
     """Extract text from an object using a path expression or pre-tokenized path.
 
     Args:
@@ -206,7 +245,7 @@ def get_text_at_path(obj: Any, path: Union[str, list[str]]) -> list[str]:
         - Nested paths in multi-field: "{field1,nested.field2}"
     """
     if not path or path == "$":
-        return [json.dumps(obj, sort_keys=True)]
+        return [json.dumps(obj, sort_keys=True, ensure_ascii=False)]
 
     tokens = tokenize_path(path) if isinstance(path, str) else path
 
@@ -217,7 +256,7 @@ def get_text_at_path(obj: Any, path: Union[str, list[str]]) -> list[str]:
             elif obj is None:
                 return []
             elif isinstance(obj, (list, dict)):
-                return [json.dumps(obj, sort_keys=True)]
+                return [json.dumps(obj, sort_keys=True, ensure_ascii=False)]
             return []
 
         token = tokens[pos]
@@ -249,7 +288,7 @@ def get_text_at_path(obj: Any, path: Union[str, list[str]]) -> list[str]:
             for field in fields:
                 nested_tokens = tokenize_path(field)
                 if nested_tokens:
-                    current_obj: Optional[dict] = obj
+                    current_obj: dict | None = obj
                     for nested_token in nested_tokens:
                         if (
                             isinstance(current_obj, dict)
@@ -263,7 +302,11 @@ def get_text_at_path(obj: Any, path: Union[str, list[str]]) -> list[str]:
                         if isinstance(current_obj, (str, int, float, bool)):
                             results.append(str(current_obj))
                         elif isinstance(current_obj, (list, dict)):
-                            results.append(json.dumps(current_obj, sort_keys=True))
+                            results.append(
+                                json.dumps(
+                                    current_obj, sort_keys=True, ensure_ascii=False
+                                )
+                            )
 
         # Handle wildcard
         elif token == "*":
@@ -371,6 +414,16 @@ def _is_async_callable(
         or hasattr(func, "__call__")  # noqa: B004
         and asyncio.iscoroutinefunction(func.__call__)
     )
+
+
+@functools.lru_cache
+def _get_init_embeddings() -> Callable[[str], Embeddings] | None:
+    try:
+        from langchain.embeddings import init_embeddings  # type: ignore
+
+        return init_embeddings
+    except ImportError:
+        return None
 
 
 __all__ = [

@@ -1,17 +1,16 @@
 # type: ignore
+from __future__ import annotations
+
 import asyncio
 import itertools
-import sys
 import uuid
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Any, Optional
+from typing import Any
 
 import pytest
 from langchain_core.embeddings import Embeddings
-from psycopg import AsyncConnection
-
 from langgraph.store.base import (
     GetOp,
     Item,
@@ -19,6 +18,9 @@ from langgraph.store.base import (
     PutOp,
     SearchOp,
 )
+from psycopg import AsyncConnection
+
+from langgraph.checkpoint.postgres import _ainternal
 from langgraph.store.postgres import AsyncPostgresStore
 from tests.conftest import (
     DEFAULT_URI,
@@ -26,12 +28,12 @@ from tests.conftest import (
     CharacterEmbeddings,
 )
 
+TTL_SECONDS = 6
+TTL_MINUTES = TTL_SECONDS / 60
+
 
 @pytest.fixture(scope="function", params=["default", "pipe", "pool"])
 async def store(request) -> AsyncIterator[AsyncPostgresStore]:
-    if sys.version_info < (3, 10):
-        pytest.skip("Async Postgres tests require Python 3.10+")
-
     database = f"test_{uuid.uuid4().hex[:16]}"
     uri_parts = DEFAULT_URI.split("/")
     uri_base = "/".join(uri_parts[:-1])
@@ -42,28 +44,54 @@ async def store(request) -> AsyncIterator[AsyncPostgresStore]:
 
     conn_string = f"{uri_base}/{database}{query_params}"
     admin_conn_string = DEFAULT_URI
-
+    ttl_config = {
+        "default_ttl": TTL_MINUTES,
+        "refresh_on_read": True,
+        "sweep_interval_minutes": TTL_MINUTES / 2,
+    }
     async with await AsyncConnection.connect(
         admin_conn_string, autocommit=True
     ) as conn:
         await conn.execute(f"CREATE DATABASE {database}")
     try:
-        async with AsyncPostgresStore.from_conn_string(conn_string) as store:
+        async with AsyncPostgresStore.from_conn_string(
+            conn_string, ttl=ttl_config
+        ) as store:
+            store.MIGRATIONS = [
+                (
+                    mig.replace("ttl_minutes INT;", "ttl_minutes FLOAT;")
+                    if isinstance(mig, str)
+                    else mig
+                )
+                for mig in store.MIGRATIONS
+            ]
             await store.setup()
+            async with store._cursor() as cur:
+                # drop the migration index
+                await cur.execute("DROP TABLE IF EXISTS store_migrations")
+            await store.setup()  # Will fail if migrations aren't idempotent
 
         if request.param == "pipe":
             async with AsyncPostgresStore.from_conn_string(
-                conn_string, pipeline=True
+                conn_string, pipeline=True, ttl=ttl_config
             ) as store:
+                await store.start_ttl_sweeper()
                 yield store
+                await store.stop_ttl_sweeper()
         elif request.param == "pool":
             async with AsyncPostgresStore.from_conn_string(
-                conn_string, pool_config={"min_size": 1, "max_size": 10}
+                conn_string, pool_config={"min_size": 1, "max_size": 10}, ttl=ttl_config
             ) as store:
+                await store.start_ttl_sweeper()
                 yield store
+                await store.stop_ttl_sweeper()
         else:  # default
-            async with AsyncPostgresStore.from_conn_string(conn_string) as store:
+            async with AsyncPostgresStore.from_conn_string(
+                conn_string, ttl=ttl_config
+            ) as store:
+                await store.start_ttl_sweeper()
                 yield store
+                await store.stop_ttl_sweeper()
     finally:
         async with await AsyncConnection.connect(
             admin_conn_string, autocommit=True
@@ -320,15 +348,66 @@ async def test_batch_list_namespaces_ops(store: AsyncPostgresStore) -> None:
 
 
 @asynccontextmanager
+async def _create_pool_store() -> AsyncIterator[AsyncPostgresStore]:
+    database = f"test_{uuid.uuid4().hex[:16]}"
+    uri_parts = DEFAULT_URI.split("/")
+    uri_base = "/".join(uri_parts[:-1])
+    query_params = ""
+    if "?" in uri_parts[-1]:
+        _, query_params = uri_parts[-1].split("?", 1)
+        query_params = "?" + query_params
+
+    conn_string = f"{uri_base}/{database}{query_params}"
+    admin_conn_string = DEFAULT_URI
+    async with await AsyncConnection.connect(
+        admin_conn_string, autocommit=True
+    ) as conn:
+        await conn.execute(f"CREATE DATABASE {database}")
+    try:
+        async with AsyncPostgresStore.from_conn_string(
+            conn_string, pool_config={"min_size": 1, "max_size": 1}
+        ) as store:
+            await store.setup()
+            yield store
+    finally:
+        async with await AsyncConnection.connect(
+            admin_conn_string, autocommit=True
+        ) as conn:
+            await conn.execute(f"DROP DATABASE {database}")
+
+
+async def test_abatch_uses_single_pool_checkout(monkeypatch) -> None:
+    async with _create_pool_store() as store:
+        await store.aput(("test",), "key1", {"data": "value1"})
+
+        original_get_connection = _ainternal.get_connection
+        checkout_count = 0
+
+        @asynccontextmanager
+        async def counting_get_connection(conn):
+            nonlocal checkout_count
+            checkout_count += 1
+            async with original_get_connection(conn) as checked_out_conn:
+                yield checked_out_conn
+
+        monkeypatch.setattr(_ainternal, "get_connection", counting_get_connection)
+
+        results = await store.abatch([GetOp(namespace=("test",), key="key1")])
+
+        assert len(results) == 1
+        assert results[0] is not None
+        assert results[0].value == {"data": "value1"}
+        assert checkout_count == 1
+
+
+@asynccontextmanager
 async def _create_vector_store(
     vector_type: str,
     distance_type: str,
     fake_embeddings: CharacterEmbeddings,
-    text_fields: Optional[list[str]] = None,
+    text_fields: list[str] | None = None,
 ) -> AsyncIterator[AsyncPostgresStore]:
     """Create a store with vector search enabled."""
-    if sys.version_info < (3, 10):
-        pytest.skip("Async Postgres tests require Python 3.10+")
 
     database = f"test_{uuid.uuid4().hex[:16]}"
     uri_parts = DEFAULT_URI.split("/")
@@ -348,7 +427,7 @@ async def _create_vector_store(
             "vector_type": vector_type,
         },
         "distance_type": distance_type,
-        "text_fields": text_fields,
+        "fields": text_fields,
     }
 
     async with await AsyncConnection.connect(
@@ -635,3 +714,160 @@ async def test_search_sorting(
         assert len(set(r.key for r in results)) == 10
         assert results[0].key == "M"
         assert results[0].score > results[1].score
+
+
+async def test_store_ttl(store):
+    # Assumes a TTL of 1 minute = 60 seconds
+    ns = ("foo",)
+    await store.start_ttl_sweeper()
+    await store.aput(
+        ns,
+        key="item1",
+        value={"foo": "bar"},
+        ttl=TTL_MINUTES,  # type: ignore
+    )
+    await asyncio.sleep(TTL_SECONDS - 2)
+    res = await store.aget(ns, key="item1", refresh_ttl=True)
+    assert res is not None
+    await asyncio.sleep(TTL_SECONDS - 2)
+    results = await store.asearch(ns, query="foo", refresh_ttl=True)
+    assert len(results) == 1
+    await asyncio.sleep(TTL_SECONDS - 2)
+    res = await store.aget(ns, key="item1", refresh_ttl=False)
+    assert res is not None
+    await asyncio.sleep(TTL_SECONDS - 1)
+    # Now has been (TTL_SECONDS-2)*2 > TTL_SECONDS + TTL_SECONDS/2
+    results = await store.asearch(ns, query="bar", refresh_ttl=False)
+    assert len(results) == 0
+
+
+async def _aexpire_now(
+    store: AsyncPostgresStore, ns: tuple[str, ...], key: str
+) -> None:
+    """Backdate a row's expires_at into the past without deleting it (unswept)."""
+    async with store._cursor() as cur:
+        await cur.execute(
+            "UPDATE store SET expires_at = NOW() - INTERVAL '1 minute' "
+            "WHERE prefix = %s AND key = %s",
+            (".".join(ns), key),
+        )
+
+
+async def _arow_exists(
+    store: AsyncPostgresStore, ns: tuple[str, ...], key: str
+) -> bool:
+    async with store._cursor() as cur:
+        await cur.execute(
+            "SELECT COUNT(*) AS n FROM store WHERE prefix = %s AND key = %s",
+            (".".join(ns), key),
+        )
+        return (await cur.fetchone())["n"] == 1
+
+
+async def _astored_expires_at(store: AsyncPostgresStore, ns: tuple[str, ...], key: str):
+    async with store._cursor() as cur:
+        await cur.execute(
+            "SELECT expires_at FROM store WHERE prefix = %s AND key = %s",
+            (".".join(ns), key),
+        )
+        return (await cur.fetchone())["expires_at"]
+
+
+async def test_omit_expired_filters_read_paths(store: AsyncPostgresStore) -> None:
+    await store.stop_ttl_sweeper()  # deterministic: no background deletion
+    store.ttl_config["omit_expired"] = True
+
+    expired_ns = ("omit", "expired")
+    control_ns = ("omit", "control")
+    await store.aput(expired_ns, "e", {"data": "gone"}, ttl=TTL_MINUTES)
+    await store.aput(control_ns, "c", {"data": "keep"}, ttl=None)
+    await _aexpire_now(store, expired_ns, "e")
+
+    # The row is expired but physically still present (unswept).
+    assert await _arow_exists(store, expired_ns, "e")
+
+    # aget omits it; the never-expiring control is still returned.
+    assert await store.aget(expired_ns, "e") is None
+    assert await store.aget(control_ns, "c") is not None
+
+    # asearch omits it but returns the control.
+    assert await store.asearch(expired_ns) == []
+    assert [i.key for i in await store.asearch(control_ns)] == ["c"]
+
+    # alist_namespaces drops the expired-only namespace, keeps the control.
+    namespaces = await store.alist_namespaces(prefix=("omit",))
+    assert expired_ns not in namespaces
+    assert control_ns in namespaces
+
+
+@pytest.mark.parametrize("omit", [None, False], ids=["default", "explicit-false"])
+async def test_omit_expired_disabled_preserves_expired_rows(
+    store: AsyncPostgresStore, omit
+) -> None:
+    await store.stop_ttl_sweeper()
+    if omit is not None:
+        store.ttl_config["omit_expired"] = omit
+
+    ns = ("keep",)
+    await store.aput(ns, "k", {"data": "still-here"}, ttl=TTL_MINUTES)
+    await _aexpire_now(store, ns, "k")
+
+    assert await store.aget(ns, "k", refresh_ttl=False) is not None
+    assert [i.key for i in await store.asearch(ns, refresh_ttl=False)] == ["k"]
+    assert ns in await store.alist_namespaces(prefix=("keep",))
+
+
+async def test_omit_expired_refresh_ttl_only_refreshes_live_rows(
+    store: AsyncPostgresStore,
+) -> None:
+    await store.stop_ttl_sweeper()
+    store.ttl_config["omit_expired"] = True
+
+    ns = ("refresh",)
+    await store.aput(ns, "expired", {"n": 0}, ttl=TTL_MINUTES)
+    await store.aput(ns, "live_get", {"n": 1}, ttl=TTL_MINUTES)
+    await store.aput(ns, "live_search", {"n": 2}, ttl=TTL_MINUTES)
+    await _aexpire_now(store, ns, "expired")
+
+    expired_before = await _astored_expires_at(store, ns, "expired")
+    get_before = await _astored_expires_at(store, ns, "live_get")
+    search_before = await _astored_expires_at(store, ns, "live_search")
+
+    # refresh_ttl=True must NOT resurrect the expired row (via aget or asearch)...
+    assert await store.aget(ns, "expired", refresh_ttl=True) is None
+    live_keys = [i.key for i in await store.asearch(ns, refresh_ttl=True)]
+    assert "expired" not in live_keys
+    assert await _astored_expires_at(store, ns, "expired") == expired_before
+
+    # ...but must still extend the live rows that were read.
+    assert await store.aget(ns, "live_get", refresh_ttl=True) is not None
+    assert await _astored_expires_at(store, ns, "live_get") > get_before
+    assert await _astored_expires_at(store, ns, "live_search") > search_before
+
+
+async def test_omit_expired_search_pagination(store: AsyncPostgresStore) -> None:
+    await store.stop_ttl_sweeper()
+    store.ttl_config["omit_expired"] = True
+
+    ns = ("page",)
+    for k in ("a", "b", "c"):
+        await store.aput(ns, k, {"k": k}, ttl=TTL_MINUTES)
+    await store.aput(ns, "expired", {"k": "x"}, ttl=TTL_MINUTES)
+    await _aexpire_now(store, ns, "expired")
+
+    seconds_ago = {"a": 1, "expired": 2, "b": 3, "c": 4}
+    # updated_at DESC orders these a, expired, b, c, so the expired row sits inside
+    # the first limit=2 window. Correct (pre-LIMIT) filtering yields live pages
+    # [a, b] then [c]; post-LIMIT filtering would underfill page 1 to just [a].
+    async with store._cursor() as cur:
+        for key, secs in seconds_ago.items():
+            await cur.execute(
+                "UPDATE store SET updated_at = NOW() - (%s * INTERVAL '1 second') "
+                "WHERE prefix = %s AND key = %s",
+                (secs, ".".join(ns), key),
+            )
+
+    page1 = await store.asearch(ns, limit=2, offset=0)
+    page2 = await store.asearch(ns, limit=2, offset=2)
+    assert [i.key for i in page1] == ["a", "b"]
+    assert [i.key for i in page2] == ["c"]

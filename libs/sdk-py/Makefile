@@ -1,7 +1,7 @@
-.PHONY: lint format
+.PHONY: lint type format test
 
 test:
-	echo "No tests to run"
+	uv run pytest tests
 
 ######################
 # LINTING AND FORMATTING
@@ -9,16 +9,18 @@ test:
 
 # Define a variable for Python and notebook files.
 PYTHON_FILES=.
-MYPY_CACHE=.mypy_cache
 lint format: PYTHON_FILES=.
 lint_diff format_diff: PYTHON_FILES=$(shell git diff --name-only --relative --diff-filter=d main . | grep -E '\.py$$|\.ipynb$$')
 
 lint lint_diff:
-	poetry run ruff check .
-	[ "$(PYTHON_FILES)" = "" ] || poetry run ruff format $(PYTHON_FILES) --diff
-	[ "$(PYTHON_FILES)" = "" ] || poetry run ruff check --select I $(PYTHON_FILES)
-	[ "$(PYTHON_FILES)" = "" ] || mkdir -p $(MYPY_CACHE) || poetry run mypy $(PYTHON_FILES) --cache-dir $(MYPY_CACHE)
+	uv run ruff check .
+	[ "$(PYTHON_FILES)" = "" ] || uv run ruff format $(PYTHON_FILES) --diff
+	[ "$(PYTHON_FILES)" = "" ] || uv run ruff check --select I $(PYTHON_FILES)
+	uv run ty check .
+
+type:
+	uv run ty check .
 
 format format_diff:
-	poetry run ruff check --select I --fix $(PYTHON_FILES)
-	poetry run ruff format $(PYTHON_FILES)
+	uv run ruff check --select I --fix $(PYTHON_FILES)
+	uv run ruff format $(PYTHON_FILES)

@@ -1,10 +1,14 @@
+import copy
 import json
 import pathlib
+import platform
 import shutil
-from typing import Literal, NamedTuple, Optional
+from collections.abc import Callable, Sequence
+from typing import Literal, NamedTuple
 
 import click.exceptions
 
+import langgraph_cli.config
 from langgraph_cli.exec import subp_exec
 
 ROOT = pathlib.Path(__file__).parent.resolve()
@@ -40,7 +44,57 @@ def _parse_version(version: str) -> Version:
         patch = "0"
     else:
         major, minor, patch = parts
-    return Version(int(major.lstrip("v")), int(minor), int(patch.split("-")[0]))
+    return Version(
+        int(major.lstrip("v")), int(minor), int(patch.split("-")[0].split("+")[0])
+    )
+
+
+def can_build_locally() -> tuple[bool, str | None]:
+    """Return whether local deployment builds can run on this machine.
+
+    Checks:
+    - Docker binary is installed
+    - Docker daemon is running
+    - Buildx is available when cross-compilation is required (non-x86_64)
+    """
+    if shutil.which("docker") is None:
+        return (
+            False,
+            "Docker is required but not installed.\n"
+            "Install Docker Desktop: https://docs.docker.com/get-docker/",
+        )
+    try:
+        import subprocess
+
+        docker_info = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            timeout=10,
+        )
+        if docker_info.returncode != 0:
+            return (
+                False,
+                "Docker is installed but not running.\nStart Docker and try again.",
+            )
+
+        if platform.machine() != "x86_64":
+            buildx = subprocess.run(
+                ["docker", "buildx", "version"],
+                capture_output=True,
+                timeout=10,
+            )
+            if buildx.returncode != 0:
+                return (
+                    False,
+                    "Docker Buildx is required but not installed.\n"
+                    "Your machine architecture ("
+                    + platform.machine()
+                    + ") requires Buildx to cross-compile images for linux/amd64.\n"
+                    "Install Buildx: https://docs.docker.com/build/install-buildx/",
+                )
+        return True, None
+    except Exception:
+        return False, "Unable to verify local Docker build support."
 
 
 def check_capabilities(runner) -> DockerCapabilities:
@@ -49,7 +103,9 @@ def check_capabilities(runner) -> DockerCapabilities:
         raise click.UsageError("Docker not installed") from None
 
     try:
-        stdout, _ = runner.run(subp_exec("docker", "info", "-f", "json", collect=True))
+        stdout, _ = runner.run(
+            subp_exec("docker", "info", "-f", "{{json .}}", collect=True)
+        )
         info = json.loads(stdout)
     except (click.exceptions.Exit, json.JSONDecodeError):
         raise click.UsageError("Docker not installed or not running") from None
@@ -86,9 +142,7 @@ def check_capabilities(runner) -> DockerCapabilities:
     )
 
 
-def debugger_compose(
-    *, port: Optional[int] = None, base_url: Optional[str] = None
-) -> dict:
+def debugger_compose(*, port: int | None = None, base_url: str | None = None) -> dict:
     if port is None:
         return ""
 
@@ -137,10 +191,17 @@ def compose_as_dict(
     capabilities: DockerCapabilities,
     *,
     port: int,
-    debugger_port: Optional[int] = None,
-    debugger_base_url: Optional[str] = None,
+    debugger_port: int | None = None,
+    debugger_base_url: str | None = None,
     # postgres://user:password@host:port/database?option=value
-    postgres_uri: Optional[str] = None,
+    postgres_uri: str | None = None,
+    # If you are running against an already-built image, you can pass it here
+    image: str | None = None,
+    # Base image to use for the LangGraph API server
+    base_image: str | None = None,
+    # API version of the base image
+    api_version: str | None = None,
+    engine_runtime_mode: str = "combined_queue_worker",
 ) -> dict:
     """Create a docker compose file as a dictionary in YML style."""
     if postgres_uri is None:
@@ -199,16 +260,22 @@ def compose_as_dict(
         )["langgraph-debugger"]
 
     # Add langgraph-api service
+    api_environment = {
+        "REDIS_URI": "redis://langgraph-redis:6379",
+        "POSTGRES_URI": postgres_uri,
+    }
+    if engine_runtime_mode == "distributed":
+        api_environment["N_JOBS_PER_WORKER"] = '"0"'
+
     services["langgraph-api"] = {
         "ports": [f'"{port}:8000"'],
         "depends_on": {
             "langgraph-redis": {"condition": "service_healthy"},
         },
-        "environment": {
-            "REDIS_URI": "redis://langgraph-redis:6379",
-            "POSTGRES_URI": postgres_uri,
-        },
+        "environment": api_environment,
     }
+    if image:
+        services["langgraph-api"]["image"] = image
 
     # If Postgres is included, add it to the dependencies of langgraph-api
     if include_db:
@@ -238,10 +305,14 @@ def compose(
     capabilities: DockerCapabilities,
     *,
     port: int,
-    debugger_port: Optional[int] = None,
-    debugger_base_url: Optional[str] = None,
+    debugger_port: int | None = None,
+    debugger_base_url: str | None = None,
     # postgres://user:password@host:port/database?option=value
-    postgres_uri: Optional[str] = None,
+    postgres_uri: str | None = None,
+    image: str | None = None,
+    base_image: str | None = None,
+    api_version: str | None = None,
+    engine_runtime_mode: str = "combined_queue_worker",
 ) -> str:
     """Create a docker compose file as a string."""
     compose_content = compose_as_dict(
@@ -250,6 +321,86 @@ def compose(
         debugger_port=debugger_port,
         debugger_base_url=debugger_base_url,
         postgres_uri=postgres_uri,
+        image=image,
+        base_image=base_image,
+        api_version=api_version,
+        engine_runtime_mode=engine_runtime_mode,
     )
     compose_str = dict_to_yaml(compose_content)
     return compose_str
+
+
+def build_docker_image(
+    runner,
+    set: Callable[[str], None],
+    config: pathlib.Path,
+    config_json: dict,
+    base_image: str | None,
+    api_version: str | None,
+    pull: bool,
+    tag: str,
+    passthrough: Sequence[str] = (),
+    install_command: str | None = None,
+    build_command: str | None = None,
+    docker_command: Sequence[str] | None = None,
+    extra_flags: Sequence[str] = (),
+    verbose: bool = True,
+):
+    """Build a Docker image from a LangGraph config."""
+    # pull latest images
+    if pull:
+        runner.run(
+            subp_exec(
+                "docker",
+                "pull",
+                langgraph_cli.config.docker_tag(config_json, base_image, api_version),
+                verbose=verbose,
+            )
+        )
+    set("Building...")
+    # apply options
+    args = [
+        "-f",
+        "-",  # stdin
+        "-t",
+        tag,
+    ]
+    # determine build context: use current directory for JS projects, config parent for Python
+    is_js_project = config_json.get("node_version") and not config_json.get(
+        "python_version"
+    )
+    # build/install commands only apply to JS projects for now
+    # without install/build command, JS projects will follow the old behavior
+    if is_js_project and (build_command or install_command):
+        build_context = str(pathlib.Path.cwd())
+    else:
+        build_context = str(config.parent)
+
+    # Deep copy to avoid mutating the caller's config (config_to_docker
+    # rewrites graph paths to container-internal paths in place).
+    config_json = copy.deepcopy(config_json)
+    stdin, additional_contexts = langgraph_cli.config.config_to_docker(
+        config_path=config,
+        config=config_json,
+        base_image=base_image,
+        api_version=api_version,
+        install_command=install_command,
+        build_command=build_command,
+        build_context=build_context,
+    )
+    # add additional_contexts
+    if additional_contexts:
+        for k, v in additional_contexts.items():
+            args.extend(["--build-context", f"{k}={v}"])
+    cmd = tuple(docker_command) if docker_command else ("docker", "build")
+    runner.run(
+        subp_exec(
+            *cmd,
+            *args,
+            *extra_flags,
+            *passthrough,
+            build_context,
+            input=stdin,
+            verbose=verbose,
+        )
+    )

@@ -99,14 +99,17 @@ Tip:
     ```
 """
 
+from __future__ import annotations
+
 import asyncio
 import concurrent.futures as cf
 import functools
 import logging
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from importlib import util
-from typing import Any, Iterable, Optional
+from typing import Any
 
 from langchain_core.embeddings import Embeddings
 
@@ -177,7 +180,7 @@ class InMemoryStore(BaseStore):
         "embeddings",
     )
 
-    def __init__(self, *, index: Optional[IndexConfig] = None) -> None:
+    def __init__(self, *, index: IndexConfig | None = None) -> None:
         # Both _data and _vectors are wrapped in the In-memory API
         # Do not change their names
         self._data: dict[tuple[str, ...], dict[str, Item]] = defaultdict(dict)
@@ -188,7 +191,7 @@ class InMemoryStore(BaseStore):
         self.index_config = index
         if self.index_config:
             self.index_config = self.index_config.copy()
-            self.embeddings: Optional[Embeddings] = ensure_embeddings(
+            self.embeddings: Embeddings | None = ensure_embeddings(
                 self.index_config.get("embed"),
             )
             self.index_config["__tokenized_fields"] = [
@@ -292,7 +295,7 @@ class InMemoryStore(BaseStore):
             if queries:
                 coros = [self.embeddings.aembed_query(q) for q in list(queries)]
                 results = await asyncio.gather(*coros)
-                queryinmem_store = dict(zip(queries, results))
+                queryinmem_store = dict(zip(queries, results, strict=False))
 
         return queryinmem_store
 
@@ -320,11 +323,13 @@ class InMemoryStore(BaseStore):
 
                 scores = _cosine_similarity(query_embedding, flat_vectors)
                 sorted_results = sorted(
-                    zip(scores, flat_items), key=lambda x: x[0], reverse=True
+                    zip(scores, flat_items, strict=False),
+                    key=lambda x: x[0],
+                    reverse=True,
                 )
                 # max pooling
                 seen: set[tuple[tuple[str, ...], str]] = set()
-                kept: list[tuple[Optional[float], Item]] = []
+                kept: list[tuple[float | None, Item]] = []
                 for score, item in sorted_results:
                     key = (item.namespace, item.key)
                     if key in seen:
@@ -449,7 +454,7 @@ class InMemoryStore(BaseStore):
                 f"Number of embeddings ({len(embeddings)}) does not"
                 f" match number of indices ({len(indices)})"
             )
-        for embedding, (ns, key, path) in zip(embeddings, indices):
+        for embedding, (ns, key, path) in zip(embeddings, indices, strict=False):
             self._vectors[ns][key][path] = embedding
 
     def _handle_list_namespaces(self, op: ListNamespacesOp) -> list[tuple[str, ...]]:
@@ -493,7 +498,7 @@ def _cosine_similarity(X: list[float], Y: list[list[float]]) -> list[float]:
     if not Y:
         return []
     if _check_numpy():
-        import numpy as np  # type: ignore
+        import numpy as np
 
         X_arr = np.array(X) if not isinstance(X, np.ndarray) else X
         Y_arr = np.array(Y) if not isinstance(Y, np.ndarray) else Y
@@ -508,7 +513,7 @@ def _cosine_similarity(X: list[float], Y: list[list[float]]) -> list[float]:
 
     similarities = []
     for y in Y:
-        dot_product = sum(a * b for a, b in zip(X, y))
+        dot_product = sum(a * b for a, b in zip(X, y, strict=False))
         norm1 = sum(a * a for a in X) ** 0.5
         norm2 = sum(a * a for a in y) ** 0.5
         similarity = dot_product / (norm1 * norm2) if norm1 > 0 and norm2 > 0 else 0.0
@@ -526,14 +531,14 @@ def _does_match(match_condition: MatchCondition, key: tuple[str, ...]) -> bool:
         return False
 
     if match_type == "prefix":
-        for k_elem, p_elem in zip(key, path):
+        for k_elem, p_elem in zip(key, path, strict=False):
             if p_elem == "*":
                 continue  # Wildcard matches any element
             if k_elem != p_elem:
                 return False
         return True
     elif match_type == "suffix":
-        for k_elem, p_elem in zip(reversed(key), reversed(path)):
+        for k_elem, p_elem in zip(reversed(key), reversed(path), strict=False):
             if p_elem == "*":
                 continue  # Wildcard matches any element
             if k_elem != p_elem:
@@ -560,7 +565,10 @@ def _compare_values(item_value: Any, filter_value: Any) -> bool:
         return (
             isinstance(item_value, (list, tuple))
             and len(item_value) == len(filter_value)
-            and all(_compare_values(iv, fv) for iv, fv in zip(item_value, filter_value))
+            and all(
+                _compare_values(iv, fv)
+                for iv, fv in zip(item_value, filter_value, strict=False)
+            )
         )
     else:
         return item_value == filter_value

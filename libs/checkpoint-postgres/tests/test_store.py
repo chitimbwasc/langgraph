@@ -1,14 +1,14 @@
 # type: ignore
+from __future__ import annotations
 
 import re
+import time
 from contextlib import contextmanager
-from typing import Any, Optional
+from typing import Any
 from uuid import uuid4
 
 import pytest
 from langchain_core.embeddings import Embeddings
-from psycopg import Connection
-
 from langgraph.store.base import (
     GetOp,
     Item,
@@ -17,12 +17,17 @@ from langgraph.store.base import (
     PutOp,
     SearchOp,
 )
+from psycopg import Connection
+
 from langgraph.store.postgres import PostgresStore
 from tests.conftest import (
     DEFAULT_URI,
     VECTOR_TYPES,
     CharacterEmbeddings,
 )
+
+TTL_SECONDS = 6
+TTL_MINUTES = TTL_SECONDS / 60
 
 
 @pytest.fixture(scope="function", params=["default", "pipe", "pool"])
@@ -32,29 +37,56 @@ def store(request) -> PostgresStore:
     uri_base = "/".join(uri_parts[:-1])
     query_params = ""
     if "?" in uri_parts[-1]:
-        db_name, query_params = uri_parts[-1].split("?", 1)
+        _, query_params = uri_parts[-1].split("?", 1)
         query_params = "?" + query_params
 
     conn_string = f"{uri_base}/{database}{query_params}"
     admin_conn_string = DEFAULT_URI
-
+    ttl_config = {
+        "default_ttl": TTL_MINUTES,
+        "refresh_on_read": True,
+        "sweep_interval_minutes": TTL_MINUTES / 2,
+    }
     with Connection.connect(admin_conn_string, autocommit=True) as conn:
         conn.execute(f"CREATE DATABASE {database}")
     try:
-        with PostgresStore.from_conn_string(conn_string) as store:
+        with PostgresStore.from_conn_string(conn_string, ttl=ttl_config) as store:
+            store.MIGRATIONS = [
+                (
+                    mig.replace("ttl_minutes INT;", "ttl_minutes FLOAT;")
+                    if isinstance(mig, str)
+                    else mig
+                )
+                for mig in store.MIGRATIONS
+            ]
             store.setup()
 
         if request.param == "pipe":
-            with PostgresStore.from_conn_string(conn_string, pipeline=True) as store:
+            with PostgresStore.from_conn_string(
+                conn_string,
+                pipeline=True,
+                ttl=ttl_config,
+            ) as store:
+                store.start_ttl_sweeper()
                 yield store
+
+                store.stop_ttl_sweeper()
         elif request.param == "pool":
             with PostgresStore.from_conn_string(
-                conn_string, pool_config={"min_size": 1, "max_size": 10}
+                conn_string,
+                pool_config={"min_size": 1, "max_size": 10},
+                ttl=ttl_config,
             ) as store:
+                store.start_ttl_sweeper()
                 yield store
+
+                store.stop_ttl_sweeper()
         else:  # default
-            with PostgresStore.from_conn_string(conn_string) as store:
+            with PostgresStore.from_conn_string(conn_string, ttl=ttl_config) as store:
+                store.start_ttl_sweeper()
                 yield store
+
+                store.stop_ttl_sweeper()
     finally:
         with Connection.connect(admin_conn_string, autocommit=True) as conn:
             conn.execute(f"DROP DATABASE {database}")
@@ -220,134 +252,127 @@ def test_batch_list_namespaces_ops(store: PostgresStore) -> None:
     assert all(ns[-1] == "public" for ns in results[2])
 
 
-class TestPostgresStore:
-    @pytest.fixture(autouse=True)
-    def setup(self) -> None:
-        with PostgresStore.from_conn_string(DEFAULT_URI) as store:
-            store.setup()
+def test_basic_store_ops(store) -> None:
+    namespace = ("test", "documents")
+    item_id = "doc1"
+    item_value = {"title": "Test Document", "content": "Hello, World!"}
 
-    def test_basic_store_ops(self) -> None:
-        with PostgresStore.from_conn_string(DEFAULT_URI) as store:
-            namespace = ("test", "documents")
-            item_id = "doc1"
-            item_value = {"title": "Test Document", "content": "Hello, World!"}
+    store.put(namespace, item_id, item_value)
+    item = store.get(namespace, item_id)
 
-            store.put(namespace, item_id, item_value)
-            item = store.get(namespace, item_id)
+    assert item
+    assert item.namespace == namespace
+    assert item.key == item_id
+    assert item.value == item_value
 
-            assert item
-            assert item.namespace == namespace
-            assert item.key == item_id
-            assert item.value == item_value
+    # Test update
+    updated_value = {"title": "Updated Document", "content": "Hello, Updated!"}
+    store.put(namespace, item_id, updated_value)
+    updated_item = store.get(namespace, item_id)
 
-            # Test update
-            updated_value = {"title": "Updated Document", "content": "Hello, Updated!"}
-            store.put(namespace, item_id, updated_value)
-            updated_item = store.get(namespace, item_id)
+    assert updated_item.value == updated_value
+    assert updated_item.updated_at > item.updated_at
 
-            assert updated_item.value == updated_value
-            assert updated_item.updated_at > item.updated_at
+    # Test get from non-existent namespace
+    different_namespace = ("test", "other_documents")
+    item_in_different_namespace = store.get(different_namespace, item_id)
+    assert item_in_different_namespace is None
 
-            # Test get from non-existent namespace
-            different_namespace = ("test", "other_documents")
-            item_in_different_namespace = store.get(different_namespace, item_id)
-            assert item_in_different_namespace is None
+    # Test delete
+    store.delete(namespace, item_id)
+    deleted_item = store.get(namespace, item_id)
+    assert deleted_item is None
 
-            # Test delete
-            store.delete(namespace, item_id)
-            deleted_item = store.get(namespace, item_id)
-            assert deleted_item is None
 
-    def test_list_namespaces(self) -> None:
-        with PostgresStore.from_conn_string(DEFAULT_URI) as store:
-            # Create test data with various namespaces
-            test_namespaces = [
-                ("test", "documents", "public"),
-                ("test", "documents", "private"),
-                ("test", "images", "public"),
-                ("test", "images", "private"),
-                ("prod", "documents", "public"),
-                ("prod", "documents", "private"),
-            ]
+def test_list_namespaces(store) -> None:
+    # Create test data with various namespaces
+    test_namespaces = [
+        ("test", "documents", "public"),
+        ("test", "documents", "private"),
+        ("test", "images", "public"),
+        ("test", "images", "private"),
+        ("prod", "documents", "public"),
+        ("prod", "documents", "private"),
+    ]
 
-            # Insert test data
-            for namespace in test_namespaces:
-                store.put(namespace, "dummy", {"content": "dummy"})
+    # Insert test data
+    for namespace in test_namespaces:
+        store.put(namespace, "dummy", {"content": "dummy"})
 
-            # Test listing with various filters
-            all_namespaces = store.list_namespaces()
-            assert len(all_namespaces) == len(test_namespaces)
+    # Test listing with various filters
+    all_namespaces = store.list_namespaces()
+    assert len(all_namespaces) == len(test_namespaces)
 
-            # Test prefix filtering
-            test_prefix_namespaces = store.list_namespaces(prefix=["test"])
-            assert len(test_prefix_namespaces) == 4
-            assert all(ns[0] == "test" for ns in test_prefix_namespaces)
+    # Test prefix filtering
+    test_prefix_namespaces = store.list_namespaces(prefix=["test"])
+    assert len(test_prefix_namespaces) == 4
+    assert all(ns[0] == "test" for ns in test_prefix_namespaces)
 
-            # Test suffix filtering
-            public_namespaces = store.list_namespaces(suffix=["public"])
-            assert len(public_namespaces) == 3
-            assert all(ns[-1] == "public" for ns in public_namespaces)
+    # Test suffix filtering
+    public_namespaces = store.list_namespaces(suffix=["public"])
+    assert len(public_namespaces) == 3
+    assert all(ns[-1] == "public" for ns in public_namespaces)
 
-            # Test max depth
-            depth_2_namespaces = store.list_namespaces(max_depth=2)
-            assert all(len(ns) <= 2 for ns in depth_2_namespaces)
+    # Test max depth
+    depth_2_namespaces = store.list_namespaces(max_depth=2)
+    assert all(len(ns) <= 2 for ns in depth_2_namespaces)
 
-            # Test pagination
-            paginated_namespaces = store.list_namespaces(limit=3)
-            assert len(paginated_namespaces) == 3
+    # Test pagination
+    paginated_namespaces = store.list_namespaces(limit=3)
+    assert len(paginated_namespaces) == 3
 
-            # Cleanup
-            for namespace in test_namespaces:
-                store.delete(namespace, "dummy")
+    # Cleanup
+    for namespace in test_namespaces:
+        store.delete(namespace, "dummy")
 
-    def test_search(self) -> None:
-        with PostgresStore.from_conn_string(DEFAULT_URI) as store:
-            # Create test data
-            test_data = [
-                (
-                    ("test", "docs"),
-                    "doc1",
-                    {"title": "First Doc", "author": "Alice", "tags": ["important"]},
-                ),
-                (
-                    ("test", "docs"),
-                    "doc2",
-                    {"title": "Second Doc", "author": "Bob", "tags": ["draft"]},
-                ),
-                (
-                    ("test", "images"),
-                    "img1",
-                    {"title": "Image 1", "author": "Alice", "tags": ["final"]},
-                ),
-            ]
 
-            for namespace, key, value in test_data:
-                store.put(namespace, key, value)
+def test_search(store) -> None:
+    # Create test data
+    test_data = [
+        (
+            ("test", "docs"),
+            "doc1",
+            {"title": "First Doc", "author": "Alice", "tags": ["important"]},
+        ),
+        (
+            ("test", "docs"),
+            "doc2",
+            {"title": "Second Doc", "author": "Bob", "tags": ["draft"]},
+        ),
+        (
+            ("test", "images"),
+            "img1",
+            {"title": "Image 1", "author": "Alice", "tags": ["final"]},
+        ),
+    ]
 
-            # Test basic search
-            all_items = store.search(["test"])
-            assert len(all_items) == 3
+    for namespace, key, value in test_data:
+        store.put(namespace, key, value)
 
-            # Test namespace filtering
-            docs_items = store.search(["test", "docs"])
-            assert len(docs_items) == 2
-            assert all(item.namespace == ("test", "docs") for item in docs_items)
+    # Test basic search
+    all_items = store.search(["test"])
+    assert len(all_items) == 3
 
-            # Test value filtering
-            alice_items = store.search(["test"], filter={"author": "Alice"})
-            assert len(alice_items) == 2
-            assert all(item.value["author"] == "Alice" for item in alice_items)
+    # Test namespace filtering
+    docs_items = store.search(["test", "docs"])
+    assert len(docs_items) == 2
+    assert all(item.namespace == ("test", "docs") for item in docs_items)
 
-            # Test pagination
-            paginated_items = store.search(["test"], limit=2)
-            assert len(paginated_items) == 2
+    # Test value filtering
+    alice_items = store.search(["test"], filter={"author": "Alice"})
+    assert len(alice_items) == 2
+    assert all(item.value["author"] == "Alice" for item in alice_items)
 
-            offset_items = store.search(["test"], offset=2)
-            assert len(offset_items) == 1
+    # Test pagination
+    paginated_items = store.search(["test"], limit=2)
+    assert len(paginated_items) == 2
 
-            # Cleanup
-            for namespace, key, _ in test_data:
-                store.delete(namespace, key)
+    offset_items = store.search(["test"], offset=2)
+    assert len(offset_items) == 1
+
+    # Cleanup
+    for namespace, key, _ in test_data:
+        store.delete(namespace, key)
 
 
 @contextmanager
@@ -355,7 +380,8 @@ def _create_vector_store(
     vector_type: str,
     distance_type: str,
     fake_embeddings: Embeddings,
-    text_fields: Optional[list[str]] = None,
+    text_fields: list[str] | None = None,
+    enable_ttl: bool = True,
 ) -> PostgresStore:
     """Create a store with vector search enabled."""
     database = f"test_{uuid4().hex[:16]}"
@@ -376,7 +402,7 @@ def _create_vector_store(
             "vector_type": vector_type,
         },
         "distance_type": distance_type,
-        "text_fields": text_fields,
+        "fields": text_fields,
     }
 
     with Connection.connect(admin_conn_string, autocommit=True) as conn:
@@ -385,23 +411,32 @@ def _create_vector_store(
         with PostgresStore.from_conn_string(
             conn_string,
             index=index_config,
+            ttl={"default_ttl": 2, "refresh_on_read": True} if enable_ttl else None,
         ) as store:
             store.setup()
+            with store._cursor() as cur:
+                # drop the migration index
+                cur.execute("DROP TABLE IF EXISTS store_migrations")
+            store.setup()  # Will fail if migrations aren't idempotent
             yield store
     finally:
         with Connection.connect(admin_conn_string, autocommit=True) as conn:
             conn.execute(f"DROP DATABASE {database}")
 
 
+_vector_params = [
+    (vector_type, distance_type, True)
+    for vector_type in VECTOR_TYPES
+    for distance_type in (
+        ["hamming"] if vector_type == "bit" else ["l2", "inner_product", "cosine"]
+    )
+]
+_vector_params += [(*_vector_params[-1][:2], False)]
+
+
 @pytest.fixture(
     scope="function",
-    params=[
-        (vector_type, distance_type)
-        for vector_type in VECTOR_TYPES
-        for distance_type in (
-            ["hamming"] if vector_type == "bit" else ["l2", "inner_product", "cosine"]
-        )
-    ],
+    params=_vector_params,
     ids=lambda p: f"{p[0]}_{p[1]}",
 )
 def vector_store(
@@ -409,8 +444,10 @@ def vector_store(
     fake_embeddings: Embeddings,
 ) -> PostgresStore:
     """Create a store with vector search enabled."""
-    vector_type, distance_type = request.param
-    with _create_vector_store(vector_type, distance_type, fake_embeddings) as store:
+    vector_type, distance_type, enable_ttl = request.param
+    with _create_vector_store(
+        vector_type, distance_type, fake_embeddings, enable_ttl=enable_ttl
+    ) as store:
         yield store
 
 
@@ -474,7 +511,10 @@ def test_vector_update_with_embedding(vector_store: PostgresStore) -> None:
     assert not any(r.key == "doc4" for r in results_new)
 
 
-def test_vector_search_with_filters(vector_store: PostgresStore) -> None:
+@pytest.mark.parametrize("refresh_ttl", [True, False])
+def test_vector_search_with_filters(
+    vector_store: PostgresStore, refresh_ttl: bool
+) -> None:
     """Test combining vector search with filters."""
     # Insert test documents
     docs = [
@@ -487,16 +527,23 @@ def test_vector_search_with_filters(vector_store: PostgresStore) -> None:
     for key, value in docs:
         vector_store.put(("test",), key, value)
 
-    results = vector_store.search(("test",), query="apple", filter={"color": "red"})
+    results = vector_store.search(
+        ("test",), query="apple", filter={"color": "red"}, refresh_ttl=refresh_ttl
+    )
     assert len(results) == 2
     assert results[0].key == "doc1"
 
-    results = vector_store.search(("test",), query="car", filter={"color": "red"})
+    results = vector_store.search(
+        ("test",), query="car", filter={"color": "red"}, refresh_ttl=refresh_ttl
+    )
     assert len(results) == 2
     assert results[0].key == "doc2"
 
     results = vector_store.search(
-        ("test",), query="bbbbluuu", filter={"score": {"$gt": 3.2}}
+        ("test",),
+        query="bbbbluuu",
+        filter={"score": {"$gt": 3.2}},
+        refresh_ttl=refresh_ttl,
     )
     assert len(results) == 3
     assert results[0].key == "doc4"
@@ -688,7 +735,7 @@ def test_embed_with_path_operation_config(
         store.put(("test",), "doc5", doc5, index=False)
         results = store.search(("test",))
         assert len(results) == 3
-        assert all(r.score is None for r in results)
+        assert all(r.score is None for r in results), f"{results}"
         assert any(r.key == "doc5" for r in results)
 
         results = store.search(("test",), query="hhh")
@@ -707,7 +754,7 @@ def _cosine_similarity(X: list[float], Y: list[list[float]]) -> list[float]:
 
     similarities = []
     for y in Y:
-        dot_product = sum(a * b for a, b in zip(X, y))
+        dot_product = sum(a * b for a, b in zip(X, y, strict=False))
         norm1 = sum(a * a for a in X) ** 0.5
         norm2 = sum(a * a for a in y) ** 0.5
         similarity = dot_product / (norm1 * norm2) if norm1 > 0 and norm2 > 0 else 0.0
@@ -724,7 +771,7 @@ def _inner_product(X: list[float], Y: list[list[float]]) -> list[float]:
 
     similarities = []
     for y in Y:
-        similarity = sum(a * b for a, b in zip(X, y))
+        similarity = sum(a * b for a, b in zip(X, y, strict=False))
         similarities.append(similarity)
 
     return similarities
@@ -738,7 +785,7 @@ def _neg_l2_distance(X: list[float], Y: list[list[float]]) -> list[float]:
 
     similarities = []
     for y in Y:
-        similarity = sum((a - b) ** 2 for a, b in zip(X, y)) ** 0.5
+        similarity = sum((a - b) ** 2 for a, b in zip(X, y, strict=False)) ** 0.5
         similarities.append(-similarity)
 
     return similarities
@@ -790,3 +837,192 @@ def test_nonnull_migrations() -> None:
     for migration in PostgresStore.MIGRATIONS:
         statement = _leading_comment_remover.sub("", migration).split()[0]
         assert statement.strip()
+
+
+def test_store_ttl(store):
+    # Assumes a TTL of 1 minute = 60 seconds
+    ns = ("foo",)
+    store.put(
+        ns,
+        key="item1",
+        value={"foo": "bar"},
+        ttl=TTL_MINUTES,  # type: ignore
+    )
+    time.sleep(TTL_SECONDS - 2)
+    res = store.get(ns, key="item1", refresh_ttl=True)
+    assert res is not None
+    time.sleep(TTL_SECONDS - 2)
+    results = store.search(ns, query="foo", refresh_ttl=True)
+    assert len(results) == 1
+    time.sleep(TTL_SECONDS - 2)
+    res = store.get(ns, key="item1", refresh_ttl=False)
+    assert res is not None
+    time.sleep(TTL_SECONDS - 1)
+    # Now has been (TTL_SECONDS-2)*2 > TTL_SECONDS + TTL_SECONDS/2
+    res = store.search(ns, query="bar", refresh_ttl=False)
+    assert len(res) == 0
+
+
+def _expire_now(store: PostgresStore, ns: tuple[str, ...], key: str) -> None:
+    """Backdate a row's expires_at into the past without deleting it (unswept)."""
+    with store._cursor() as cur:
+        cur.execute(
+            "UPDATE store SET expires_at = NOW() - INTERVAL '1 minute' "
+            "WHERE prefix = %s AND key = %s",
+            (".".join(ns), key),
+        )
+
+
+def _row_exists(store: PostgresStore, ns: tuple[str, ...], key: str) -> bool:
+    with store._cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM store WHERE prefix = %s AND key = %s",
+            (".".join(ns), key),
+        )
+        return cur.fetchone()["n"] == 1
+
+
+def _stored_expires_at(store: PostgresStore, ns: tuple[str, ...], key: str):
+    with store._cursor() as cur:
+        cur.execute(
+            "SELECT expires_at FROM store WHERE prefix = %s AND key = %s",
+            (".".join(ns), key),
+        )
+        return cur.fetchone()["expires_at"]
+
+
+def test_omit_expired_filters_read_paths(store: PostgresStore) -> None:
+    store.stop_ttl_sweeper()  # deterministic: no background deletion
+    store.ttl_config["omit_expired"] = True
+
+    expired_ns = ("omit", "expired")
+    control_ns = ("omit", "control")
+    store.put(expired_ns, "e", {"data": "gone"}, ttl=TTL_MINUTES)
+    store.put(control_ns, "c", {"data": "keep"}, ttl=None)
+    _expire_now(store, expired_ns, "e")
+
+    # The row is expired but physically still present (unswept).
+    assert _row_exists(store, expired_ns, "e")
+
+    # get omits it; the never-expiring control is still returned.
+    assert store.get(expired_ns, "e") is None
+    assert store.get(control_ns, "c") is not None
+
+    # search omits it but returns the control.
+    assert store.search(expired_ns) == []
+    assert [i.key for i in store.search(control_ns)] == ["c"]
+
+    # list_namespaces drops the expired-only namespace, keeps the control.
+    namespaces = store.list_namespaces(prefix=("omit",))
+    assert expired_ns not in namespaces
+    assert control_ns in namespaces
+
+
+@pytest.mark.parametrize("omit", [None, False], ids=["default", "explicit-false"])
+def test_omit_expired_disabled_preserves_expired_rows(
+    store: PostgresStore, omit
+) -> None:
+    store.stop_ttl_sweeper()
+    if omit is not None:
+        store.ttl_config["omit_expired"] = omit
+
+    ns = ("keep",)
+    store.put(ns, "k", {"data": "still-here"}, ttl=TTL_MINUTES)
+    _expire_now(store, ns, "k")
+
+    assert store.get(ns, "k", refresh_ttl=False) is not None
+    assert [i.key for i in store.search(ns, refresh_ttl=False)] == ["k"]
+    assert ns in store.list_namespaces(prefix=("keep",))
+
+
+def test_omit_expired_refresh_ttl_only_refreshes_live_rows(
+    store: PostgresStore,
+) -> None:
+    store.stop_ttl_sweeper()
+    store.ttl_config["omit_expired"] = True
+
+    ns = ("refresh",)
+    store.put(ns, "expired", {"n": 0}, ttl=TTL_MINUTES)
+    store.put(ns, "live_get", {"n": 1}, ttl=TTL_MINUTES)
+    store.put(ns, "live_search", {"n": 2}, ttl=TTL_MINUTES)
+    _expire_now(store, ns, "expired")
+
+    expired_before = _stored_expires_at(store, ns, "expired")
+    get_before = _stored_expires_at(store, ns, "live_get")
+    search_before = _stored_expires_at(store, ns, "live_search")
+
+    # refresh_ttl=True must NOT resurrect the expired row (via get or search)...
+    assert store.get(ns, "expired", refresh_ttl=True) is None
+    assert "expired" not in [i.key for i in store.search(ns, refresh_ttl=True)]
+    assert _stored_expires_at(store, ns, "expired") == expired_before
+
+    # ...but must still extend the live rows that were read.
+    assert store.get(ns, "live_get", refresh_ttl=True) is not None
+    assert _stored_expires_at(store, ns, "live_get") > get_before
+    assert _stored_expires_at(store, ns, "live_search") > search_before
+
+
+def test_omit_expired_search_pagination(store: PostgresStore) -> None:
+    store.stop_ttl_sweeper()
+    store.ttl_config["omit_expired"] = True
+
+    ns = ("page",)
+    for k in ("a", "b", "c"):
+        store.put(ns, k, {"k": k}, ttl=TTL_MINUTES)
+    store.put(ns, "expired", {"k": "x"}, ttl=TTL_MINUTES)
+    _expire_now(store, ns, "expired")
+
+    seconds_ago = {"a": 1, "expired": 2, "b": 3, "c": 4}
+    # updated_at DESC orders these a, expired, b, c, so the expired row sits inside
+    # the first limit=2 window. Correct (pre-LIMIT) filtering yields live pages
+    # [a, b] then [c]; post-LIMIT filtering would underfill page 1 to just [a].
+    with store._cursor() as cur:
+        for key, secs in seconds_ago.items():
+            cur.execute(
+                "UPDATE store SET updated_at = NOW() - (%s * INTERVAL '1 second') "
+                "WHERE prefix = %s AND key = %s",
+                (secs, ".".join(ns), key),
+            )
+
+    page1 = store.search(ns, limit=2, offset=0)
+    page2 = store.search(ns, limit=2, offset=2)
+    assert [i.key for i in page1] == ["a", "b"]
+    assert [i.key for i in page2] == ["c"]
+
+
+@pytest.mark.parametrize(
+    "vector_type,distance_type",
+    [
+        ("vector", "cosine"),
+        ("vector", "inner_product"),
+        ("halfvec", "cosine"),
+        ("halfvec", "inner_product"),
+    ],
+)
+def test_non_ascii(
+    request: Any,
+    fake_embeddings: CharacterEmbeddings,
+    vector_type: str,
+    distance_type: str,
+) -> None:
+    """Test support for non-ascii characters"""
+    with _create_vector_store(vector_type, distance_type, fake_embeddings) as store:
+        store.put(("user_123", "memories"), "1", {"text": "这是中文"})  # Chinese
+        store.put(
+            ("user_123", "memories"), "2", {"text": "これは日本語です"}
+        )  # Japanese
+        store.put(("user_123", "memories"), "3", {"text": "이건 한국어야"})  # Korean
+        store.put(("user_123", "memories"), "4", {"text": "Это русский"})  # Russian
+        store.put(("user_123", "memories"), "5", {"text": "यह रूसी है"})  # Hindi
+
+        result1 = store.search(("user_123", "memories"), query="这是中文")
+        result2 = store.search(("user_123", "memories"), query="これは日本語です")
+        result3 = store.search(("user_123", "memories"), query="이건 한국어야")
+        result4 = store.search(("user_123", "memories"), query="Это русский")
+        result5 = store.search(("user_123", "memories"), query="यह रूसी है")
+
+        assert result1[0].key == "1"
+        assert result2[0].key == "2"
+        assert result3[0].key == "3"
+        assert result4[0].key == "4"
+        assert result5[0].key == "5"

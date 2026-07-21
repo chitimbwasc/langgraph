@@ -1,25 +1,30 @@
 """Data models for interacting with the LangGraph API."""
 
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import Field
 from datetime import datetime
 from typing import (
     Any,
-    Dict,
+    ClassVar,
     Literal,
     NamedTuple,
-    Optional,
-    Sequence,
-    Tuple,
-    TypedDict,
+    Protocol,
+    TypeAlias,
     Union,
 )
 
-Json = Optional[dict[str, Any]]
+from typing_extensions import NotRequired, TypedDict
+
+Json = dict[str, Any] | None
 """Represents a JSON-like structure, which can be None or a dictionary with string keys and any values."""
 
-RunStatus = Literal["pending", "error", "success", "timeout", "interrupted"]
+RunStatus = Literal["pending", "running", "error", "success", "timeout", "interrupted"]
 """
 Represents the status of a run:
 - "pending": The run is waiting to start.
+- "running": The run is currently executing.
 - "error": The run encountered an error and stopped.
 - "success": The run completed successfully.
 - "timeout": The run exceeded its time limit.
@@ -35,8 +40,24 @@ Represents the status of a thread:
 - "error": An exception occurred during task processing.
 """
 
+ThreadStreamMode = Literal["run_modes", "lifecycle", "state_update"]
+"""
+Defines the mode of streaming:
+- "run_modes": Stream the same events as the runs on thread, as well as run_done events.
+- "lifecycle": Stream only run start/end events.
+- "state_update": Stream state updates on the thread.
+"""
+
 StreamMode = Literal[
-    "values", "messages", "updates", "events", "debug", "custom", "messages-tuple"
+    "values",
+    "messages",
+    "updates",
+    "events",
+    "tasks",
+    "checkpoints",
+    "debug",
+    "custom",
+    "messages-tuple",
 ]
 """
 Defines the mode of streaming:
@@ -44,6 +65,8 @@ Defines the mode of streaming:
 - "messages": Stream complete messages.
 - "updates": Stream updates to the state.
 - "events": Stream events occurring during execution.
+- "checkpoints": Stream checkpoints as they are created.
+- "tasks": Stream task start and finish events.
 - "debug": Stream detailed debug information.
 - "custom": Stream custom events.
 """
@@ -78,6 +101,22 @@ Defines action after completion:
 - "keep": Retain resources after completion.
 """
 
+Durability = Literal["sync", "async", "exit"]
+"""Durability mode for the graph execution.
+- `"sync"`: Changes are persisted synchronously before the next step starts.
+- `"async"`: Changes are persisted asynchronously while the next step executes.
+- `"exit"`: Changes are persisted only when the graph exits."""
+
+
+class LangSmithTracing(TypedDict, total=False):
+    """Configuration for LangSmith tracing."""
+
+    project_name: str
+    """The LangSmith project name to trace to."""
+    example_id: str
+    """The LangSmith example/dataset ID to associate with the trace."""
+
+
 All = Literal["*"]
 """Represents a wildcard or 'all' selector."""
 
@@ -88,11 +127,58 @@ Specifies behavior if the thread doesn't exist:
 - "reject": Reject the operation if the thread doesn't exist.
 """
 
+PruneStrategy = Literal["delete", "keep_latest"]
+"""
+Strategy for pruning threads:
+- "delete": Remove threads entirely.
+- "keep_latest": Prune old checkpoints but keep threads and their latest state.
+"""
+
 CancelAction = Literal["interrupt", "rollback"]
 """
 Action to take when cancelling the run.
 - "interrupt": Simply cancel the run.
 - "rollback": Cancel the run. Then delete the run and associated checkpoints.
+"""
+
+BulkCancelRunsStatus = Literal["pending", "running", "all"]
+"""
+Filter runs by status when bulk-cancelling:
+- "pending": Cancel only pending runs.
+- "running": Cancel only running runs.
+- "all": Cancel all runs regardless of status.
+"""
+
+AssistantSortBy = Literal[
+    "assistant_id", "graph_id", "name", "created_at", "updated_at"
+]
+"""
+The field to sort by.
+"""
+
+ThreadSortBy = Literal[
+    "thread_id", "status", "created_at", "updated_at", "state_updated_at"
+]
+"""
+The field to sort by.
+"""
+
+CronSortBy = Literal[
+    "cron_id",
+    "assistant_id",
+    "thread_id",
+    "created_at",
+    "updated_at",
+    "next_run_date",
+    "end_time",
+]
+"""
+The field to sort by.
+"""
+
+SortOrder = Literal["asc", "desc"]
+"""
+The order to sort by.
 """
 
 
@@ -114,7 +200,7 @@ class Config(TypedDict, total=False):
     """
     Runtime values for attributes previously made configurable on this Runnable,
     or sub-Runnables, through .configurable_fields() or .configurable_alternatives().
-    Check .output_schema() for a description of the attributes that have been made 
+    Check .output_schema() for a description of the attributes that have been made
     configurable.
     """
 
@@ -125,10 +211,10 @@ class Checkpoint(TypedDict):
     thread_id: str
     """Unique identifier for the thread associated with this checkpoint."""
     checkpoint_ns: str
-    """Namespace for the checkpoint, used for organization and retrieval."""
-    checkpoint_id: Optional[str]
+    """Namespace for the checkpoint; used internally to manage subgraph state."""
+    checkpoint_id: str | None
     """Optional unique identifier for the checkpoint itself."""
-    checkpoint_map: Optional[dict[str, Any]]
+    checkpoint_map: dict[str, Any] | None
     """Optional dictionary containing checkpoint-specific data."""
 
 
@@ -137,17 +223,20 @@ class GraphSchema(TypedDict):
 
     graph_id: str
     """The ID of the graph."""
-    input_schema: Optional[dict]
+    input_schema: dict | None
     """The schema for the graph input.
     Missing if unable to generate JSON schema from graph."""
-    output_schema: Optional[dict]
+    output_schema: dict | None
     """The schema for the graph output.
     Missing if unable to generate JSON schema from graph."""
-    state_schema: Optional[dict]
+    state_schema: dict | None
     """The schema for the graph state.
     Missing if unable to generate JSON schema from graph."""
-    config_schema: Optional[dict]
+    config_schema: dict | None
     """The schema for the graph config.
+    Missing if unable to generate JSON schema from graph."""
+    context_schema: dict | None
+    """The schema for the graph context.
     Missing if unable to generate JSON schema from graph."""
 
 
@@ -163,12 +252,18 @@ class AssistantBase(TypedDict):
     """The ID of the graph."""
     config: Config
     """The assistant config."""
+    context: Context
+    """The static context of the assistant."""
     created_at: datetime
     """The time the assistant was created."""
     metadata: Json
     """The assistant metadata."""
     version: int
     """The version of the assistant"""
+    name: str
+    """The name of the assistant"""
+    description: str | None
+    """The description of the assistant"""
 
 
 class AssistantVersion(AssistantBase):
@@ -182,21 +277,24 @@ class Assistant(AssistantBase):
 
     updated_at: datetime
     """The last time the assistant was updated."""
-    name: str
-    """The name of the assistant"""
 
 
-class Interrupt(TypedDict, total=False):
+class AssistantsSearchResponse(TypedDict):
+    """Paginated response for assistant search results."""
+
+    assistants: list[Assistant]
+    """The assistants returned for the current search page."""
+    next: str | None
+    """Pagination cursor from the ``X-Pagination-Next`` response header."""
+
+
+class Interrupt(TypedDict):
     """Represents an interruption in the execution flow."""
 
     value: Any
     """The value associated with the interrupt."""
-    when: Literal["during"]
-    """When the interrupt occurred."""
-    resumable: bool
-    """Whether the interrupt can be resumed."""
-    ns: Optional[list[str]]
-    """Optional namespace for the interrupt."""
+    id: str
+    """The ID of the interrupt. Can be used to resume the interrupt."""
 
 
 class Thread(TypedDict):
@@ -214,8 +312,10 @@ class Thread(TypedDict):
     """The status of the thread, one of 'idle', 'busy', 'interrupted'."""
     values: Json
     """The current state of the thread."""
-    interrupts: Dict[str, list[Interrupt]]
-    """Interrupts which were thrown in this thread"""
+    interrupts: dict[str, list[Interrupt]]
+    """Mapping of task ids to interrupts that were raised in that task."""
+    extracted: NotRequired[dict[str, Any]]
+    """Extracted values from thread data. Only present when `extract` is used in search."""
 
 
 class ThreadTask(TypedDict):
@@ -223,31 +323,33 @@ class ThreadTask(TypedDict):
 
     id: str
     name: str
-    error: Optional[str]
+    error: str | None
     interrupts: list[Interrupt]
-    checkpoint: Optional[Checkpoint]
-    state: Optional["ThreadState"]
-    result: Optional[dict[str, Any]]
+    checkpoint: Checkpoint | None
+    state: ThreadState | None
+    result: dict[str, Any] | None
 
 
 class ThreadState(TypedDict):
     """Represents the state of a thread."""
 
-    values: Union[list[dict], dict[str, Any]]
+    values: list[dict] | dict[str, Any]
     """The state values."""
     next: Sequence[str]
-    """The next nodes to execute. If empty, the thread is done until new input is 
+    """The next nodes to execute. If empty, the thread is done until new input is
     received."""
     checkpoint: Checkpoint
     """The ID of the checkpoint."""
     metadata: Json
     """Metadata for this state"""
-    created_at: Optional[str]
+    created_at: str | None
     """Timestamp of state creation"""
-    parent_checkpoint: Optional[Checkpoint]
+    parent_checkpoint: Checkpoint | None
     """The ID of the parent checkpoint. If missing, this is the root checkpoint."""
     tasks: Sequence[ThreadTask]
     """Tasks to execute in this step. If already attempted, may contain an error."""
+    interrupts: list[Interrupt]
+    """Interrupts which were thrown in this thread."""
 
 
 class ThreadUpdateStateResponse(TypedDict):
@@ -283,42 +385,164 @@ class Cron(TypedDict):
 
     cron_id: str
     """The ID of the cron."""
-    thread_id: Optional[str]
+    assistant_id: str
+    """The ID of the assistant."""
+    thread_id: str | None
     """The ID of the thread."""
-    end_time: Optional[datetime]
+    on_run_completed: OnCompletionBehavior | None
+    """What to do with the thread after the run completes. Only applicable for stateless crons."""
+    end_time: datetime | None
     """The end date to stop running the cron."""
     schedule: str
     """The schedule to run, cron format."""
+    timezone: str | None
+    """IANA timezone for the cron schedule (e.g. 'America/New_York'). Defaults to null, which is treated as UTC."""
     created_at: datetime
     """The time the cron was created."""
     updated_at: datetime
     """The last time the cron was updated."""
     payload: dict
     """The run payload to use for creating new run."""
+    user_id: str | None
+    """The user ID of the cron."""
+    next_run_date: datetime | None
+    """The next run date of the cron."""
+    metadata: dict
+    """The metadata of the cron."""
+    enabled: bool
+    """Whether the cron is enabled."""
+
+
+class CronUpdate(TypedDict, total=False):
+    """Payload for updating a cron job. All fields are optional."""
+
+    schedule: str
+    """The cron schedule to execute this job on."""
+    timezone: str
+    """IANA timezone for the cron schedule (e.g. 'America/New_York')."""
+    end_time: datetime
+    """The end date to stop running the cron."""
+    input: Input
+    """The input to the graph."""
+    metadata: dict[str, Any]
+    """Metadata to assign to the cron job runs."""
+    config: Config
+    """The configuration for the assistant."""
+    context: Context
+    """Static context added to the assistant."""
+    webhook: str
+    """Webhook to call after LangGraph API call is done."""
+    interrupt_before: All | list[str]
+    """Nodes to interrupt immediately before they get executed."""
+    interrupt_after: All | list[str]
+    """Nodes to interrupt immediately after they get executed."""
+    on_run_completed: OnCompletionBehavior
+    """What to do with the thread after the run completes."""
+    enabled: bool
+    """Enable or disable the cron job."""
+    stream_mode: StreamMode | list[StreamMode]
+    """The stream mode(s) to use."""
+    stream_subgraphs: bool
+    """Whether to stream output from subgraphs."""
+    stream_resumable: bool
+    """Whether to persist the stream chunks in order to resume the stream later."""
+    durability: Durability
+    """Durability level for the run. Must be one of 'sync', 'async', or 'exit'."""
+
+
+# Select field aliases for client-side typing of `select` parameters.
+# These mirror the server's allowed field sets.
+
+AssistantSelectField = Literal[
+    "assistant_id",
+    "graph_id",
+    "name",
+    "description",
+    "config",
+    "context",
+    "created_at",
+    "updated_at",
+    "metadata",
+    "version",
+]
+
+ThreadSelectField = Literal[
+    "thread_id",
+    "created_at",
+    "updated_at",
+    "metadata",
+    "config",
+    "context",
+    "status",
+    "values",
+    "interrupts",
+]
+
+RunSelectField = Literal[
+    "run_id",
+    "thread_id",
+    "assistant_id",
+    "created_at",
+    "updated_at",
+    "status",
+    "metadata",
+    "kwargs",
+    "multitask_strategy",
+]
+
+CronSelectField = Literal[
+    "cron_id",
+    "assistant_id",
+    "thread_id",
+    "end_time",
+    "schedule",
+    "timezone",
+    "created_at",
+    "updated_at",
+    "user_id",
+    "payload",
+    "next_run_date",
+    "metadata",
+    "now",
+    "on_run_completed",
+    "enabled",
+]
+
+PrimitiveData = str | int | float | bool | None
+
+QueryParamTypes = (
+    Mapping[str, PrimitiveData | Sequence[PrimitiveData]]
+    | list[tuple[str, PrimitiveData]]
+    | tuple[tuple[str, PrimitiveData], ...]
+    | str
+    | bytes
+)
 
 
 class RunCreate(TypedDict):
     """Defines the parameters for initiating a background run."""
 
-    thread_id: Optional[str]
+    thread_id: str | None
     """The identifier of the thread to run. If not provided, the run is stateless."""
     assistant_id: str
     """The identifier of the assistant to use for this run."""
-    input: Optional[dict]
+    input: dict | None
     """Initial input data for the run."""
-    metadata: Optional[dict]
+    metadata: dict | None
     """Additional metadata to associate with the run."""
-    config: Optional[Config]
+    config: Config | None
     """Configuration options for the run."""
-    checkpoint_id: Optional[str]
+    context: Context | None
+    """The static context of the run."""
+    checkpoint_id: str | None
     """The identifier of a checkpoint to resume from."""
-    interrupt_before: Optional[list[str]]
+    interrupt_before: list[str] | None
     """List of node names to interrupt execution before."""
-    interrupt_after: Optional[list[str]]
+    interrupt_after: list[str] | None
     """List of node names to interrupt execution after."""
-    webhook: Optional[str]
+    webhook: str | None
     """URL to send webhook notifications about the run's progress."""
-    multitask_strategy: Optional[MultitaskStrategy]
+    multitask_strategy: MultitaskStrategy | None
     """Strategy for handling concurrent runs on the same thread."""
 
 
@@ -332,7 +556,7 @@ class Item(TypedDict):
     """The namespace of the item. A namespace is analogous to a document's directory."""
     key: str
     """The unique identifier of the item within its namespace.
-    
+
     In general, keys needn't be globally unique.
     """
     value: dict[str, Any]
@@ -358,7 +582,7 @@ class SearchItem(Item, total=False):
             searching a compatible store with a natural language query.
     """
 
-    score: Optional[float]
+    score: float | None
 
 
 class SearchItemsResponse(TypedDict):
@@ -375,14 +599,377 @@ class StreamPart(NamedTuple):
     """The type of event for this stream part."""
     data: dict
     """The data payload associated with the event."""
+    id: str | None = None
+    """The ID of the event."""
+
+
+StreamVersion = Literal["v1", "v2"]
+"""Stream format version.
+
+- `"v1"`: Traditional format — raw SSE `StreamPart` NamedTuples.
+- `"v2"`: Each event is a typed dict with `type`, `ns`, and `data` keys.
+"""
+
+
+# --- Typed payload dicts (JSON-deserialized from the server) ---
+
+
+class TaskPayload(TypedDict):
+    """Payload for a task start event."""
+
+    id: str
+    """Unique identifier for this task."""
+    name: str
+    """Name of the node being executed."""
+    input: Any
+    """Input data passed to the task."""
+    triggers: list[str]
+    """List of triggers that caused this task to be executed (e.g. channel writes)."""
+
+
+class TaskResultPayload(TypedDict):
+    """Payload for a task result event."""
+
+    id: str
+    """Unique identifier for this task."""
+    name: str
+    """Name of the node that was executed."""
+    error: str | None
+    """Error message if the task failed, otherwise `None`."""
+    interrupts: list[dict[str, Any]]
+    """List of interrupts that occurred during task execution."""
+    result: dict[str, Any]
+    """Mapping of channel names to the values written by this task."""
+
+
+class CheckpointTaskPayload(TypedDict):
+    """A task entry within a `CheckpointPayload`.
+
+    The keys present depend on the task's state:
+
+    - **Error:** `id`, `name`, `error`, `state`
+    - **Has result:** `id`, `name`, `result`, `interrupts`, `state`
+    - **Pending:** `id`, `name`, `interrupts`, `state`
+    """
+
+    id: str
+    """Unique identifier for this task."""
+    name: str
+    """Name of the node being executed."""
+    error: NotRequired[str]
+    """Error message, present only if the task failed."""
+    result: NotRequired[Any]
+    """Result of the task, present only if the task completed successfully."""
+    interrupts: NotRequired[list[dict[str, Any]]]
+    """List of interrupts, present when the task has been interrupted or completed."""
+    state: dict[str, Any] | None
+    """Snapshot of the subgraph state. `None` if not a subgraph."""
+
+
+class CheckpointPayload(TypedDict):
+    """Payload for a checkpoint event."""
+
+    config: dict[str, Any] | None
+    """Configuration for this checkpoint, including the `thread_id` and `checkpoint_id`."""
+    metadata: dict[str, Any]
+    """Metadata associated with this checkpoint (e.g. step number, source, writes)."""
+    values: dict[str, Any]
+    """Current state values at the time of this checkpoint."""
+    next: list[str]
+    """Names of the nodes scheduled to execute next."""
+    parent_config: dict[str, Any] | None
+    """Configuration of the parent checkpoint, or `None` if this is the first checkpoint."""
+    tasks: list[CheckpointTaskPayload]
+    """List of tasks associated with this checkpoint."""
+
+
+class _DebugCheckpointPayload(TypedDict):
+    step: int
+    """The step number in the graph execution."""
+    timestamp: str
+    """ISO 8601 timestamp of when this event occurred."""
+    type: Literal["checkpoint"]
+    """Event type discriminator, always `"checkpoint"`."""
+    payload: CheckpointPayload
+    """The checkpoint payload."""
+
+
+class _DebugTaskPayload(TypedDict):
+    step: int
+    """The step number in the graph execution."""
+    timestamp: str
+    """ISO 8601 timestamp of when this event occurred."""
+    type: Literal["task"]
+    """Event type discriminator, always `"task"`."""
+    payload: TaskPayload
+    """The task start payload."""
+
+
+class _DebugTaskResultPayload(TypedDict):
+    step: int
+    """The step number in the graph execution."""
+    timestamp: str
+    """ISO 8601 timestamp of when this event occurred."""
+    type: Literal["task_result"]
+    """Event type discriminator, always `"task_result"`."""
+    payload: TaskResultPayload
+    """The task result payload."""
+
+
+DebugPayload = _DebugCheckpointPayload | _DebugTaskPayload | _DebugTaskResultPayload
+"""Wrapper payload for debug events. Discriminate on `type`."""
+
+
+class RunMetadataPayload(TypedDict):
+    """Payload for the `metadata` control event."""
+
+    run_id: str
+    """The unique identifier of the run."""
+
+
+# --- v2 stream part TypedDicts ---
+
+
+class ValuesStreamPart(TypedDict):
+    """Stream part emitted for `stream_mode="values"`."""
+
+    type: Literal["values"]
+    """Stream part type discriminator."""
+    ns: list[str]
+    """Namespace path of the emitting node (empty for root graph)."""
+    data: dict[str, Any]
+    """Full state values after the step."""
+    interrupts: list[dict[str, Any]]
+    """List of interrupts that occurred during this step."""
+
+
+class UpdatesStreamPart(TypedDict):
+    """Stream part emitted for `stream_mode="updates"`."""
+
+    type: Literal["updates"]
+    """Stream part type discriminator."""
+    ns: list[str]
+    """Namespace path of the emitting node (empty for root graph)."""
+    data: dict[str, Any]
+    """Mapping of node names to their outputs."""
+
+
+class MessagesPartialStreamPart(TypedDict):
+    """Stream part emitted for partial message chunks (`messages/partial`)."""
+
+    type: Literal["messages/partial"]
+    """Stream part type discriminator."""
+    ns: list[str]
+    """Namespace path of the emitting node (empty for root graph)."""
+    data: list[dict[str, Any]]
+    """List of partial message chunk dicts."""
+
+
+class MessagesCompleteStreamPart(TypedDict):
+    """Stream part emitted for complete messages (`messages/complete`)."""
+
+    type: Literal["messages/complete"]
+    """Stream part type discriminator."""
+    ns: list[str]
+    """Namespace path of the emitting node (empty for root graph)."""
+    data: list[dict[str, Any]]
+    """List of complete message dicts."""
+
+
+class MessagesMetadataStreamPart(TypedDict):
+    """Stream part emitted for message metadata (`messages/metadata`)."""
+
+    type: Literal["messages/metadata"]
+    """Stream part type discriminator."""
+    ns: list[str]
+    """Namespace path of the emitting node (empty for root graph)."""
+    data: dict[str, Any]
+    """Metadata dict for the message (e.g. `langgraph_step`, `langgraph_node`)."""
+
+
+class MessagesTupleStreamPart(TypedDict):
+    """Stream part emitted for `stream_mode="messages"` (raw message+metadata pair)."""
+
+    type: Literal["messages"]
+    """Stream part type discriminator."""
+    ns: list[str]
+    """Namespace path of the emitting node (empty for root graph)."""
+    data: list[dict[str, Any]]
+    """Two-element list of `[message_dict, metadata_dict]`."""
+
+
+class CustomStreamPart(TypedDict):
+    """Stream part emitted for `stream_mode="custom"`."""
+
+    type: Literal["custom"]
+    """Stream part type discriminator."""
+    ns: list[str]
+    """Namespace path of the emitting node (empty for root graph)."""
+    data: Any
+    """User-defined data passed to `StreamWriter` inside a node."""
+
+
+class CheckpointsStreamPart(TypedDict):
+    """Stream part emitted for `stream_mode="checkpoints"`."""
+
+    type: Literal["checkpoints"]
+    """Stream part type discriminator."""
+    ns: list[str]
+    """Namespace path of the emitting node (empty for root graph)."""
+    data: CheckpointPayload
+    """The checkpoint payload."""
+
+
+class TasksStreamPart(TypedDict):
+    """Stream part emitted for `stream_mode="tasks"`."""
+
+    type: Literal["tasks"]
+    """Stream part type discriminator."""
+    ns: list[str]
+    """Namespace path of the emitting node (empty for root graph)."""
+    data: TaskPayload | TaskResultPayload
+    """Task start or task result payload."""
+
+
+class DebugStreamPart(TypedDict):
+    """Stream part emitted for `stream_mode="debug"`."""
+
+    type: Literal["debug"]
+    """Stream part type discriminator."""
+    ns: list[str]
+    """Namespace path of the emitting node (empty for root graph)."""
+    data: DebugPayload
+    """The debug event payload."""
+
+
+class MetadataStreamPart(TypedDict):
+    """Control event with `run_id` and other run metadata."""
+
+    type: Literal["metadata"]
+    """Stream part type discriminator."""
+    ns: list[str]
+    """Namespace path (empty for root graph)."""
+    data: RunMetadataPayload
+    """The run metadata payload."""
+
+
+StreamPartV2 = (
+    ValuesStreamPart
+    | UpdatesStreamPart
+    | MessagesPartialStreamPart
+    | MessagesCompleteStreamPart
+    | MessagesMetadataStreamPart
+    | MessagesTupleStreamPart
+    | CustomStreamPart
+    | CheckpointsStreamPart
+    | TasksStreamPart
+    | DebugStreamPart
+    | MetadataStreamPart
+)
+"""Discriminated union of all v2 stream part types.
+
+Use `part["type"]` to narrow the type.
+"""
 
 
 class Send(TypedDict):
+    """Represents a message to be sent to a specific node in the graph.
+
+    This type is used to explicitly send messages to nodes in the graph, typically
+    used within Command objects to control graph execution flow.
+    """
+
     node: str
-    input: Optional[dict[str, Any]]
+    """The name of the target node to send the message to."""
+    input: dict[str, Any] | None
+    """Optional dictionary containing the input data to be passed to the node.
+
+    If None, the node will be called with no input."""
 
 
 class Command(TypedDict, total=False):
-    goto: Union[Send, str, Sequence[Union[Send, str]]]
-    update: Union[dict[str, Any], Sequence[Tuple[str, Any]]]
+    """Represents one or more commands to control graph execution flow and state.
+
+    This type defines the control commands that can be returned by nodes to influence
+    graph execution. It lets you navigate to other nodes, update graph state,
+    and resume from interruptions.
+    """
+
+    goto: Send | str | Sequence[Send | str]
+    """Specifies where execution should continue. Can be:
+
+        - A string node name to navigate to
+        - A Send object to execute a node with specific input
+        - A sequence of node names or Send objects to execute in order
+    """
+    update: dict[str, Any] | Sequence[tuple[str, Any]]
+    """Updates to apply to the graph's state. Can be:
+
+        - A dictionary of state updates to merge
+        - A sequence of (key, value) tuples for ordered updates
+    """
     resume: Any
+    """Value to resume execution with after an interruption.
+       Used in conjunction with interrupt() to implement control flow.
+    """
+
+
+class RunCreateMetadata(TypedDict):
+    """Metadata for a run creation request."""
+
+    run_id: str
+    """The ID of the run."""
+
+    thread_id: str | None
+    """The ID of the thread."""
+
+
+class _TypedDictLikeV1(Protocol):
+    """Protocol to represent types that behave like TypedDicts
+
+    Version 1: using `ClassVar` for keys."""
+
+    __required_keys__: ClassVar[frozenset[str]]
+    __optional_keys__: ClassVar[frozenset[str]]
+
+
+class _TypedDictLikeV2(Protocol):
+    """Protocol to represent types that behave like TypedDicts
+
+    Version 2: not using `ClassVar` for keys."""
+
+    __required_keys__: frozenset[str]
+    __optional_keys__: frozenset[str]
+
+
+class _DataclassLike(Protocol):
+    """Protocol to represent types that behave like dataclasses.
+
+    Inspired by the private _DataclassT from dataclasses that uses a similar protocol as a bound.
+    """
+
+    __dataclass_fields__: ClassVar[dict[str, Field[Any]]]
+
+
+class _BaseModelLike(Protocol):
+    """Protocol to represent types that behave like Pydantic `BaseModel`."""
+
+    model_config: ClassVar[dict[str, Any]]
+    __pydantic_core_schema__: ClassVar[Any]
+
+    def model_dump(
+        self,
+        **kwargs: Any,
+    ) -> dict[str, Any]: ...
+
+
+_JSONLike: TypeAlias = None | str | int | float | bool
+_JSONMap: TypeAlias = Mapping[
+    str, Union[_JSONLike, list[_JSONLike], "_JSONMap", list["_JSONMap"]]
+]
+
+Input: TypeAlias = (
+    _TypedDictLikeV1 | _TypedDictLikeV2 | _DataclassLike | _BaseModelLike | _JSONMap
+)
+
+Context: TypeAlias = Input

@@ -1,7 +1,13 @@
 import re
-from typing import Any, Sequence, Union
+from collections.abc import Sequence
+from typing import Any
 
 from typing_extensions import Self
+
+
+class AnyObject:
+    def __eq__(self, value):
+        return True
 
 
 class FloatBetween(float):
@@ -25,7 +31,7 @@ class FloatBetween(float):
 
 
 class AnyStr(str):
-    def __init__(self, prefix: Union[str, re.Pattern] = "") -> None:
+    def __init__(self, prefix: str | re.Pattern = "") -> None:
         super().__init__()
         self.prefix = prefix
 

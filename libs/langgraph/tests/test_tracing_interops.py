@@ -1,7 +1,8 @@
 import json
 import sys
 import time
-from typing import Any, Callable, Tuple, TypeVar
+from collections.abc import Callable
+from typing import Any, TypeVar
 from unittest.mock import MagicMock
 
 import langsmith as ls
@@ -35,7 +36,7 @@ T = TypeVar("T")
 
 
 def wait_for(
-    condition: Callable[[], Tuple[T, bool]],
+    condition: Callable[[], tuple[T, bool]],
     max_sleep_time: int = 10,
     sleep_time: int = 3,
 ) -> T:

@@ -1,20 +1,29 @@
+"""Utilities for batching operations in a background task."""
+
+from __future__ import annotations
+
 import asyncio
 import functools
 import weakref
-from typing import Any, Callable, Iterable, Literal, Optional, TypeVar, Union
+from collections.abc import Callable, Iterable
+from typing import Any, Literal, TypeVar
 
 from langgraph.store.base import (
+    NOT_PROVIDED,
     BaseStore,
     GetOp,
     Item,
     ListNamespacesOp,
     MatchCondition,
     NamespacePath,
+    NotProvided,
     Op,
     PutOp,
     Result,
     SearchItem,
     SearchOp,
+    _ensure_refresh,
+    _ensure_ttl,
     _validate_namespace,
 )
 
@@ -23,7 +32,7 @@ F = TypeVar("F", bound=Callable)
 
 def _check_loop(func: F) -> F:
     @functools.wraps(func)
-    def wrapper(store: "AsyncBatchedBaseStore", *args: Any, **kwargs: Any) -> Any:
+    def wrapper(store: AsyncBatchedBaseStore, *args: Any, **kwargs: Any) -> Any:
         method_name: str = func.__name__
         try:
             current_loop = asyncio.get_running_loop()
@@ -54,19 +63,41 @@ class AsyncBatchedBaseStore(BaseStore):
     def __init__(self) -> None:
         super().__init__()
         self._loop = asyncio.get_running_loop()
-        self._aqueue: dict[asyncio.Future, Op] = {}
-        self._task = self._loop.create_task(_run(self._aqueue, weakref.ref(self)))
+        self._aqueue: asyncio.Queue[tuple[asyncio.Future, Op]] = asyncio.Queue()
+        self._task: asyncio.Task | None = None
+        self._ensure_task()
 
     def __del__(self) -> None:
-        self._task.cancel()
+        try:
+            if self._task:
+                self._task.cancel()
+        except RuntimeError:
+            pass
+
+    def _ensure_task(self) -> None:
+        """Ensure the background processing loop is running."""
+        if self._task is None or self._task.done():
+            self._task = self._loop.create_task(_run(self._aqueue, weakref.ref(self)))
 
     async def aget(
         self,
         namespace: tuple[str, ...],
         key: str,
-    ) -> Optional[Item]:
+        *,
+        refresh_ttl: bool | None = None,
+    ) -> Item | None:
+        self._ensure_task()
         fut = self._loop.create_future()
-        self._aqueue[fut] = GetOp(namespace, key)
+        self._aqueue.put_nowait(
+            (
+                fut,
+                GetOp(
+                    namespace,
+                    key,
+                    refresh_ttl=_ensure_refresh(self.ttl_config, refresh_ttl),
+                ),
+            )
+        )
         return await fut
 
     async def asearch(
@@ -74,13 +105,27 @@ class AsyncBatchedBaseStore(BaseStore):
         namespace_prefix: tuple[str, ...],
         /,
         *,
-        query: Optional[str] = None,
-        filter: Optional[dict[str, Any]] = None,
+        query: str | None = None,
+        filter: dict[str, Any] | None = None,
         limit: int = 10,
         offset: int = 0,
+        refresh_ttl: bool | None = None,
     ) -> list[SearchItem]:
+        self._ensure_task()
         fut = self._loop.create_future()
-        self._aqueue[fut] = SearchOp(namespace_prefix, filter, limit, offset, query)
+        self._aqueue.put_nowait(
+            (
+                fut,
+                SearchOp(
+                    namespace_prefix,
+                    filter,
+                    limit,
+                    offset,
+                    query,
+                    refresh_ttl=_ensure_refresh(self.ttl_config, refresh_ttl),
+                ),
+            )
+        )
         return await fut
 
     async def aput(
@@ -88,11 +133,21 @@ class AsyncBatchedBaseStore(BaseStore):
         namespace: tuple[str, ...],
         key: str,
         value: dict[str, Any],
-        index: Optional[Union[Literal[False], list[str]]] = None,
+        index: Literal[False] | list[str] | None = None,
+        *,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
     ) -> None:
+        self._ensure_task()
         _validate_namespace(namespace)
         fut = self._loop.create_future()
-        self._aqueue[fut] = PutOp(namespace, key, value, index)
+        self._aqueue.put_nowait(
+            (
+                fut,
+                PutOp(
+                    namespace, key, value, index, ttl=_ensure_ttl(self.ttl_config, ttl)
+                ),
+            )
+        )
         return await fut
 
     async def adelete(
@@ -100,19 +155,21 @@ class AsyncBatchedBaseStore(BaseStore):
         namespace: tuple[str, ...],
         key: str,
     ) -> None:
+        self._ensure_task()
         fut = self._loop.create_future()
-        self._aqueue[fut] = PutOp(namespace, key, None)
+        self._aqueue.put_nowait((fut, PutOp(namespace, key, None)))
         return await fut
 
     async def alist_namespaces(
         self,
         *,
-        prefix: Optional[NamespacePath] = None,
-        suffix: Optional[NamespacePath] = None,
-        max_depth: Optional[int] = None,
+        prefix: NamespacePath | None = None,
+        suffix: NamespacePath | None = None,
+        max_depth: int | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[tuple[str, ...]]:
+        self._ensure_task()
         fut = self._loop.create_future()
         match_conditions = []
         if prefix:
@@ -126,7 +183,7 @@ class AsyncBatchedBaseStore(BaseStore):
             limit=limit,
             offset=offset,
         )
-        self._aqueue[fut] = op
+        self._aqueue.put_nowait((fut, op))
         return await fut
 
     @_check_loop
@@ -138,9 +195,11 @@ class AsyncBatchedBaseStore(BaseStore):
         self,
         namespace: tuple[str, ...],
         key: str,
-    ) -> Optional[Item]:
+        *,
+        refresh_ttl: bool | None = None,
+    ) -> Item | None:
         return asyncio.run_coroutine_threadsafe(
-            self.aget(namespace, key=key), self._loop
+            self.aget(namespace, key=key, refresh_ttl=refresh_ttl), self._loop
         ).result()
 
     @_check_loop
@@ -149,14 +208,20 @@ class AsyncBatchedBaseStore(BaseStore):
         namespace_prefix: tuple[str, ...],
         /,
         *,
-        query: Optional[str] = None,
-        filter: Optional[dict[str, Any]] = None,
+        query: str | None = None,
+        filter: dict[str, Any] | None = None,
         limit: int = 10,
         offset: int = 0,
+        refresh_ttl: bool | None = None,
     ) -> list[SearchItem]:
         return asyncio.run_coroutine_threadsafe(
             self.asearch(
-                namespace_prefix, query=query, filter=filter, limit=limit, offset=offset
+                namespace_prefix,
+                query=query,
+                filter=filter,
+                limit=limit,
+                offset=offset,
+                refresh_ttl=refresh_ttl,
             ),
             self._loop,
         ).result()
@@ -167,11 +232,20 @@ class AsyncBatchedBaseStore(BaseStore):
         namespace: tuple[str, ...],
         key: str,
         value: dict[str, Any],
-        index: Optional[Union[Literal[False], list[str]]] = None,
+        index: Literal[False] | list[str] | None = None,
+        *,
+        ttl: float | None | NotProvided = NOT_PROVIDED,
     ) -> None:
         _validate_namespace(namespace)
         asyncio.run_coroutine_threadsafe(
-            self.aput(namespace, key=key, value=value, index=index), self._loop
+            self.aput(
+                namespace,
+                key=key,
+                value=value,
+                index=index,
+                ttl=_ensure_ttl(self.ttl_config, ttl),
+            ),
+            self._loop,
         ).result()
 
     @_check_loop
@@ -188,9 +262,9 @@ class AsyncBatchedBaseStore(BaseStore):
     def list_namespaces(
         self,
         *,
-        prefix: Optional[NamespacePath] = None,
-        suffix: Optional[NamespacePath] = None,
-        max_depth: Optional[int] = None,
+        prefix: NamespacePath | None = None,
+        suffix: NamespacePath | None = None,
+        max_depth: int | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[tuple[str, ...]]:
@@ -206,7 +280,7 @@ class AsyncBatchedBaseStore(BaseStore):
         ).result()
 
 
-def _dedupe_ops(values: list[Op]) -> tuple[Optional[list[int]], list[Op]]:
+def _dedupe_ops(values: list[Op]) -> tuple[list[int] | None, list[Op]]:
     """Dedupe operations while preserving order for results.
 
     Args:
@@ -250,34 +324,48 @@ def _dedupe_ops(values: list[Op]) -> tuple[Optional[list[int]], list[Op]]:
 
 
 async def _run(
-    aqueue: dict[asyncio.Future, Op],
+    aqueue: asyncio.Queue[tuple[asyncio.Future, Op]],
     store: weakref.ReferenceType[BaseStore],
 ) -> None:
-    while True:
-        await asyncio.sleep(0)
-        if not aqueue:
+    while item := await aqueue.get():
+        # don't run batch if the future is done (e.g. cancelled)
+        if item[0].done():
             continue
+        # check if store is still alive
         if s := store():
-            # get the operations to run
-            taken = aqueue.copy()
-            # action each operation
             try:
-                values = list(taken.values())
-                listen, dedupped = _dedupe_ops(values)
-                results = await s.abatch(dedupped)
-                if listen is not None:
-                    results = [results[ix] for ix in listen]
+                # accumulate operations scheduled in same tick
+                items = [item]
+                try:
+                    while item := aqueue.get_nowait():
+                        # don't insert if the future is done (e.g. cancelled)
+                        if item[0].done():
+                            continue
+                        items.append(item)
+                except asyncio.QueueEmpty:
+                    pass
+                # get the operations to run
+                futs = [item[0] for item in items]
+                values = [item[1] for item in items]
+                # action each operation
+                try:
+                    listen, dedupped = _dedupe_ops(values)
+                    results = await s.abatch(dedupped)
+                    if listen is not None:
+                        results = [results[ix] for ix in listen]
 
-                # set the results of each operation
-                for fut, result in zip(taken, results):
-                    fut.set_result(result)
-            except Exception as e:
-                for fut in taken:
-                    fut.set_exception(e)
-            # remove the operations from the queue
-            for fut in taken:
-                del aqueue[fut]
+                    # set the results of each operation
+                    for fut, result in zip(futs, results, strict=False):
+                        # guard against future being done (e.g. cancelled)
+                        if not fut.done():
+                            fut.set_result(result)
+                except Exception as e:
+                    for fut in futs:
+                        # guard against future being done (e.g. cancelled)
+                        if not fut.done():
+                            fut.set_exception(e)
+            finally:
+                # remove strong ref to store
+                del s
         else:
             break
-        # remove strong ref to store
-        del s

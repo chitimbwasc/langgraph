@@ -1,16 +1,23 @@
 import inspect
+import operator
 import warnings
 from dataclasses import dataclass, field
+from typing import Annotated, Any, Union
 from typing import Annotated as Annotated2
-from typing import Any, Optional
 
 import pytest
-from langchain_core.runnables import RunnableConfig, RunnableLambda
-from pydantic.v1 import BaseModel
-from typing_extensions import Annotated, NotRequired, Required, TypedDict
+from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel
+from typing_extensions import NotRequired, Required, TypedDict
 
-from langgraph.graph.state import StateGraph, _get_node_name, _warn_invalid_state_schema
-from langgraph.managed.shared_value import SharedValue
+from langgraph.channels.binop import BinaryOperatorAggregate
+from langgraph.channels.ephemeral_value import EphemeralValue
+from langgraph.graph.state import (
+    StateGraph,
+    _get_node_name,
+    _is_field_channel,
+    _warn_invalid_state_schema,
+)
 
 
 class State(BaseModel):
@@ -92,7 +99,7 @@ def test_state_schema_with_type_hint():
             assert state.pop("foo") == "bar"
             return {"input_state": state}
 
-    graph = StateGraph(InputState, output=OutputState)
+    graph = StateGraph(InputState, output_schema=OutputState)
     actions = [
         complete_hint,
         miss_first_hint,
@@ -132,19 +139,19 @@ def test_state_schema_with_type_hint():
 def test_state_schema_optional_values(total_: bool):
     class SomeParentState(TypedDict):
         val0a: str
-        val0b: Optional[str]
+        val0b: str | None
 
     class InputState(SomeParentState, total=total_):  # type: ignore
         val1: str
-        val2: Optional[str]
-        val3: Required[str]
+        val2: str | None
+        val3: Required[Annotated[dict, operator.or_]]
         val4: NotRequired[dict]
         val5: Annotated[Required[str], "foo"]
         val6: Annotated[NotRequired[str], "bar"]
 
     class OutputState(SomeParentState, total=total_):  # type: ignore
         out_val1: str
-        out_val2: Optional[str]
+        out_val2: str | None
         out_val3: Required[str]
         out_val4: NotRequired[dict]
         out_val5: Annotated[Required[str], "foo"]
@@ -152,27 +159,25 @@ def test_state_schema_optional_values(total_: bool):
 
     class State(InputState):  # this would be ignored
         val4: dict
-        some_shared_channel: Annotated[str, SharedValue.on("assistant_id")] = field(
-            default="foo"
-        )
 
-    builder = StateGraph(State, input=InputState, output=OutputState)
+    builder = StateGraph(State, input_schema=InputState, output_schema=OutputState)
     builder.add_node("n", lambda x: x)
     builder.add_edge("__start__", "n")
     graph = builder.compile()
     json_schema = graph.get_input_jsonschema()
 
+    assert isinstance(graph.channels["val3"], BinaryOperatorAggregate)
+
     if total_ is False:
         expected_required = set()
         expected_optional = {"val2", "val1"}
     else:
-        expected_required = {"val1"}
-
-        expected_optional = {"val2"}
+        expected_required = {"val1", "val2"}
+        expected_optional = set()
 
     # The others should always have precedence based on the required annotation
-    expected_required |= {"val0a", "val3", "val5"}
-    expected_optional |= {"val0b", "val4", "val6"}
+    expected_required |= {"val0a", "val0b", "val3", "val5"}
+    expected_optional |= {"val4", "val6"}
 
     assert set(json_schema.get("required", set())) == expected_required
     assert (
@@ -185,11 +190,11 @@ def test_state_schema_optional_values(total_: bool):
         expected_required = set()
         expected_optional = {"out_val2", "out_val1"}
     else:
-        expected_required = {"out_val1"}
-        expected_optional = {"out_val2"}
+        expected_required = {"out_val1", "out_val2"}
+        expected_optional = set()
 
-    expected_required |= {"val0a", "out_val3", "out_val5"}
-    expected_optional |= {"val0b", "out_val4", "out_val6"}
+    expected_required |= {"val0a", "val0b", "out_val3", "out_val5"}
+    expected_optional |= {"out_val4", "out_val6"}
 
     assert set(output_schema.get("required", set())) == expected_required
     assert (
@@ -206,9 +211,9 @@ def test_state_schema_default_values(kw_only_: bool):
     @dataclass(**kwargs)
     class InputState:
         val1: str
-        val2: Optional[int]
-        val3: Annotated[Optional[float], "optional annotated"]
-        val4: Optional[str] = None
+        val2: int | None
+        val3: Annotated[float | None, "optional annotated"]
+        val4: str | None = None
         val5: list[int] = field(default_factory=lambda: [1, 2, 3])
         val6: dict[str, int] = field(default_factory=lambda: {"a": 1})
         val7: str = field(default=...)
@@ -217,9 +222,6 @@ def test_state_schema_default_values(kw_only_: bool):
         val10: str = "default"
         val11: Annotated[list[str], "annotated list"] = field(
             default_factory=lambda: ["a", "b"]
-        )
-        some_shared_channel: Annotated[str, SharedValue.on("assistant_id")] = field(
-            default="foo"
         )
 
     builder = StateGraph(InputState)
@@ -246,67 +248,7 @@ def test_state_schema_default_values(kw_only_: bool):
     )
 
 
-def test_raises_invalid_managed():
-    class BadInputState(TypedDict):
-        some_thing: str
-        some_input_channel: Annotated[str, SharedValue.on("assistant_id")]
-
-    class InputState(TypedDict):
-        some_thing: str
-        some_input_channel: str
-
-    class BadOutputState(TypedDict):
-        some_thing: str
-        some_output_channel: Annotated[str, SharedValue.on("assistant_id")]
-
-    class OutputState(TypedDict):
-        some_thing: str
-        some_output_channel: str
-
-    class State(TypedDict):
-        some_thing: str
-        some_channel: Annotated[str, SharedValue.on("assistant_id")]
-
-    # All OK
-    StateGraph(State, input=InputState, output=OutputState)
-    StateGraph(State)
-    StateGraph(State, input=State, output=State)
-    StateGraph(State, input=InputState)
-    StateGraph(State, input=InputState)
-
-    bad_input_examples = [
-        (State, BadInputState, OutputState),
-        (State, BadInputState, BadOutputState),
-        (State, BadInputState, State),
-        (State, BadInputState, None),
-    ]
-    for _state, _inp, _outp in bad_input_examples:
-        with pytest.raises(
-            ValueError,
-            match="Invalid managed channels detected in BadInputState: some_input_channel. Managed channels are not permitted in Input/Output schema.",
-        ):
-            StateGraph(_state, input=_inp, output=_outp)
-    bad_output_examples = [
-        (State, InputState, BadOutputState),
-        (State, None, BadOutputState),
-    ]
-    for _state, _inp, _outp in bad_output_examples:
-        with pytest.raises(
-            ValueError,
-            match="Invalid managed channels detected in BadOutputState: some_output_channel. Managed channels are not permitted in Input/Output schema.",
-        ):
-            StateGraph(_state, input=_inp, output=_outp)
-
-
 def test__get_node_name() -> None:
-    # default runnable name
-    assert _get_node_name(RunnableLambda(func=lambda x: x)) == "RunnableLambda"
-    # custom runnable name
-    assert (
-        _get_node_name(RunnableLambda(name="my_runnable", func=lambda x: x))
-        == "my_runnable"
-    )
-
     # lambda
     assert _get_node_name(lambda x: x) == "<lambda>"
 
@@ -328,3 +270,104 @@ def test__get_node_name() -> None:
 
     # class method
     assert _get_node_name(MyClass().class_method) == "class_method"
+
+
+def test_input_schema_conditional_edge():
+    class OverallState(TypedDict):
+        foo: Annotated[int, operator.add]
+        bar: str
+
+    class PrivateState(TypedDict):
+        baz: str
+
+    builder = StateGraph(OverallState)
+
+    def node_1(state: OverallState):
+        return {"foo": 1, "baz": "bar"}
+
+    def node_2(state: PrivateState):
+        return {"foo": 1, "bar": state["baz"], "something_else": "meow"}
+
+    def node_3(state: OverallState):
+        return {"foo": 1}
+
+    def router(state: OverallState):
+        assert state == {"foo": 2, "bar": "bar"}
+        if state["foo"] == 2:
+            return "node_3"
+        else:
+            return "__end__"
+
+    builder.add_node(node_1)
+    builder.add_node(node_2)
+    builder.add_node(node_3)
+    builder.add_conditional_edges("node_2", router)
+    builder.add_edge("__start__", "node_1")
+    builder.add_edge("node_1", "node_2")
+    graph = builder.compile()
+    assert graph.invoke({"foo": 0}) == {"foo": 3, "bar": "bar"}
+
+
+def test_private_input_schema_conditional_edge():
+    class OverallState(TypedDict):
+        foo: Annotated[int, operator.add]
+        bar: str
+
+    class RouterState(TypedDict):
+        baz: str
+
+    class Node2State(TypedDict):
+        foo: Annotated[int, operator.add]
+        baz: str
+
+    builder = StateGraph(OverallState)
+
+    def node_1(state: OverallState):
+        return {"foo": 1, "baz": "meow"}
+
+    def node_2(state: Node2State):
+        return {"foo": 1, "bar": state["baz"]}
+
+    def router(state: RouterState):
+        assert state == {"baz": "meow"}
+        if state["baz"] == "meow":
+            return "node_2"
+        else:
+            return "__end__"
+
+    builder.add_node(node_1)
+    builder.add_node(node_2)
+    builder.add_conditional_edges("node_1", router)
+    builder.add_edge("__start__", "node_1")
+    graph = builder.compile()
+    assert graph.invoke({"foo": 0}) == {"foo": 2, "bar": "meow"}
+
+
+def test_is_field_channel() -> None:
+    """Test channel detection across all scenarios."""
+    # Basic detection
+    result = _is_field_channel(Annotated[int, EphemeralValue])
+    assert isinstance(result, EphemeralValue) and result.typ is int
+
+    # Main fix: handles extraneous annotations
+    result = _is_field_channel(Annotated[str, "metadata", EphemeralValue, "more"])
+    assert isinstance(result, EphemeralValue) and result.typ is str
+
+    # Complex types work
+    union_type = Union[int, str]  # noqa: UP007
+    result = _is_field_channel(Annotated[union_type, EphemeralValue])
+    assert isinstance(result, EphemeralValue) and result.typ is union_type
+
+    # Pre-instantiated channels
+    instantiated = EphemeralValue(int)
+    result = _is_field_channel(Annotated[int, instantiated])
+    assert result is instantiated
+
+    # Pre-instantiated channels with multiple annotations
+    instantiated = EphemeralValue(int)
+    result = _is_field_channel(Annotated[int, "metadata", instantiated, "more"])
+    assert result is instantiated
+
+    # No channel cases
+    assert _is_field_channel(int) is None
+    assert _is_field_channel(Annotated[int, "just_metadata"]) is None

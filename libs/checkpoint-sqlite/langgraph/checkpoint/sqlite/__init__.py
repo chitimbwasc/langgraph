@@ -1,11 +1,14 @@
+from __future__ import annotations
+
+import json
 import random
 import sqlite3
 import threading
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
-from typing import Any, AsyncIterator, Dict, Iterator, Optional, Sequence, Tuple
+from typing import Any, cast
 
 from langchain_core.runnables import RunnableConfig
-
 from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
     BaseCheckpointSaver,
@@ -13,11 +16,19 @@ from langgraph.checkpoint.base import (
     Checkpoint,
     CheckpointMetadata,
     CheckpointTuple,
+    DeltaChannelHistory,
     SerializerProtocol,
     get_checkpoint_id,
+    get_checkpoint_metadata,
 )
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
-from langgraph.checkpoint.serde.types import ChannelProtocol
+
+from langgraph.checkpoint.sqlite._delta import (
+    DELTA_STAGE1_SQL,
+    build_delta_channels_writes_history,
+    build_delta_stage2_sql,
+    step_walk_with_row,
+)
 from langgraph.checkpoint.sqlite.utils import search_where
 
 _AIO_ERROR_MSG = (
@@ -26,7 +37,7 @@ _AIO_ERROR_MSG = (
     "from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver\n"
     "Note: AsyncSqliteSaver requires the aiosqlite package to use.\n"
     "Install with:\n`pip install aiosqlite`\n"
-    "See https://langchain-ai.github.io/langgraph/reference/checkpoints/asyncsqlitesaver"
+    "See https://langchain-ai.github.io/langgraph/reference/checkpoints/#langgraph.checkpoint.sqlite.aio.AsyncSqliteSaver"
     "for more information."
 )
 
@@ -55,7 +66,10 @@ class SqliteSaver(BaseCheckpointSaver[str]):
         >>> builder.add_node("add_one", lambda x: x + 1)
         >>> builder.set_entry_point("add_one")
         >>> builder.set_finish_point("add_one")
-        >>> conn = sqlite3.connect("checkpoints.sqlite")
+        >>> # Create a new SqliteSaver instance
+        >>> # Note: check_same_thread=False is OK as the implementation uses a lock
+        >>> # to ensure thread safety.
+        >>> conn = sqlite3.connect("checkpoints.sqlite", check_same_thread=False)
         >>> memory = SqliteSaver(conn)
         >>> graph = builder.compile(checkpointer=memory)
         >>> config = {"configurable": {"thread_id": "1"}}
@@ -72,7 +86,7 @@ class SqliteSaver(BaseCheckpointSaver[str]):
         self,
         conn: sqlite3.Connection,
         *,
-        serde: Optional[SerializerProtocol] = None,
+        serde: SerializerProtocol | None = None,
     ) -> None:
         super().__init__(serde=serde)
         self.jsonplus_serde = JsonPlusSerializer()
@@ -82,11 +96,11 @@ class SqliteSaver(BaseCheckpointSaver[str]):
 
     @classmethod
     @contextmanager
-    def from_conn_string(cls, conn_string: str) -> Iterator["SqliteSaver"]:
+    def from_conn_string(cls, conn_string: str) -> Iterator[SqliteSaver]:
         """Create a new SqliteSaver instance from a connection string.
 
         Args:
-            conn_string (str): The SQLite connection string.
+            conn_string: The SQLite connection string.
 
         Yields:
             SqliteSaver: A new SqliteSaver instance.
@@ -174,19 +188,19 @@ class SqliteSaver(BaseCheckpointSaver[str]):
                     self.conn.commit()
                 cur.close()
 
-    def get_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
+    def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Get a checkpoint tuple from the database.
 
         This method retrieves a checkpoint tuple from the SQLite database based on the
-        provided config. If the config contains a "checkpoint_id" key, the checkpoint with
+        provided config. If the config contains a `checkpoint_id` key, the checkpoint with
         the matching thread ID and checkpoint ID is retrieved. Otherwise, the latest checkpoint
         for the given thread ID is retrieved.
 
         Args:
-            config (RunnableConfig): The config to use for retrieving the checkpoint.
+            config: The config to use for retrieving the checkpoint.
 
         Returns:
-            Optional[CheckpointTuple]: The retrieved checkpoint tuple, or None if no matching checkpoint was found.
+            The retrieved checkpoint tuple, or None if no matching checkpoint was found.
 
         Examples:
 
@@ -257,7 +271,10 @@ class SqliteSaver(BaseCheckpointSaver[str]):
                 return CheckpointTuple(
                     config,
                     self.serde.loads_typed((type, checkpoint)),
-                    self.jsonplus_serde.loads(metadata) if metadata is not None else {},
+                    cast(
+                        CheckpointMetadata,
+                        json.loads(metadata) if metadata is not None else {},
+                    ),
                     (
                         {
                             "configurable": {
@@ -277,11 +294,11 @@ class SqliteSaver(BaseCheckpointSaver[str]):
 
     def list(
         self,
-        config: Optional[RunnableConfig],
+        config: RunnableConfig | None,
         *,
-        filter: Optional[Dict[str, Any]] = None,
-        before: Optional[RunnableConfig] = None,
-        limit: Optional[int] = None,
+        filter: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
     ) -> Iterator[CheckpointTuple]:
         """List checkpoints from the database.
 
@@ -289,13 +306,13 @@ class SqliteSaver(BaseCheckpointSaver[str]):
         on the provided config. The checkpoints are ordered by checkpoint ID in descending order (newest first).
 
         Args:
-            config (RunnableConfig): The config to use for listing the checkpoints.
-            filter (Optional[Dict[str, Any]]): Additional filtering criteria for metadata. Defaults to None.
-            before (Optional[RunnableConfig]): If provided, only checkpoints before the specified checkpoint ID are returned. Defaults to None.
-            limit (Optional[int]): The maximum number of checkpoints to return. Defaults to None.
+            config: The config to use for listing the checkpoints.
+            filter: Additional filtering criteria for metadata.
+            before: If provided, only checkpoints before the specified checkpoint ID are returned.
+            limit: The maximum number of checkpoints to return.
 
         Yields:
-            Iterator[CheckpointTuple]: An iterator of checkpoint tuples.
+            An iterator of checkpoint tuples.
 
         Examples:
             >>> from langgraph.checkpoint.sqlite import SqliteSaver
@@ -319,8 +336,9 @@ class SqliteSaver(BaseCheckpointSaver[str]):
         FROM checkpoints
         {where}
         ORDER BY checkpoint_id DESC"""
-        if limit:
-            query += f" LIMIT {limit}"
+        if limit is not None:
+            query += " LIMIT ?"
+            param_values = (*param_values, limit)
         with self.cursor(transaction=False) as cur, closing(self.conn.cursor()) as wcur:
             cur.execute(query, param_values)
             for (
@@ -345,7 +363,10 @@ class SqliteSaver(BaseCheckpointSaver[str]):
                         }
                     },
                     self.serde.loads_typed((type, checkpoint)),
-                    self.jsonplus_serde.loads(metadata) if metadata is not None else {},
+                    cast(
+                        CheckpointMetadata,
+                        json.loads(metadata) if metadata is not None else {},
+                    ),
                     (
                         {
                             "configurable": {
@@ -376,10 +397,10 @@ class SqliteSaver(BaseCheckpointSaver[str]):
         with the provided config and its parent config (if any).
 
         Args:
-            config (RunnableConfig): The config to associate with the checkpoint.
-            checkpoint (Checkpoint): The checkpoint to save.
-            metadata (CheckpointMetadata): Additional metadata to save with the checkpoint.
-            new_versions (ChannelVersions): New channel versions as of this write.
+            config: The config to associate with the checkpoint.
+            checkpoint: The checkpoint to save.
+            metadata: Additional metadata to save with the checkpoint.
+            new_versions: New channel versions as of this write.
 
         Returns:
             RunnableConfig: Updated configuration after storing the checkpoint.
@@ -397,7 +418,9 @@ class SqliteSaver(BaseCheckpointSaver[str]):
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"]["checkpoint_ns"]
         type_, serialized_checkpoint = self.serde.dumps_typed(checkpoint)
-        serialized_metadata = self.jsonplus_serde.dumps(metadata)
+        serialized_metadata = json.dumps(
+            get_checkpoint_metadata(config, metadata), ensure_ascii=False
+        ).encode("utf-8", "ignore")
         with self.cursor() as cur:
             cur.execute(
                 "INSERT OR REPLACE INTO checkpoints (thread_id, checkpoint_ns, checkpoint_id, parent_checkpoint_id, type, checkpoint, metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -422,7 +445,7 @@ class SqliteSaver(BaseCheckpointSaver[str]):
     def put_writes(
         self,
         config: RunnableConfig,
-        writes: Sequence[Tuple[str, Any]],
+        writes: Sequence[tuple[str, Any]],
         task_id: str,
         task_path: str = "",
     ) -> None:
@@ -431,10 +454,10 @@ class SqliteSaver(BaseCheckpointSaver[str]):
         This method saves intermediate writes associated with a checkpoint to the SQLite database.
 
         Args:
-            config (RunnableConfig): Configuration of the related checkpoint.
-            writes (Sequence[Tuple[str, Any]]): List of writes to store, each as (channel, value) pair.
-            task_id (str): Identifier for the task creating the writes.
-            task_path (str): Path of the task creating the writes.
+            config: Configuration of the related checkpoint.
+            writes: List of writes to store, each as (channel, value) pair.
+            task_id: Identifier for the task creating the writes.
+            task_path: Path of the task creating the writes.
         """
         query = (
             "INSERT OR REPLACE INTO writes (thread_id, checkpoint_ns, checkpoint_id, task_id, idx, channel, type, value) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -458,7 +481,108 @@ class SqliteSaver(BaseCheckpointSaver[str]):
                 ],
             )
 
-    async def aget_tuple(self, config: RunnableConfig) -> Optional[CheckpointTuple]:
+    def delete_thread(self, thread_id: str) -> None:
+        """Delete all checkpoints and writes associated with a thread ID.
+
+        Args:
+            thread_id: The thread ID to delete.
+
+        Returns:
+            None
+        """
+        with self.cursor() as cur:
+            cur.execute(
+                "DELETE FROM checkpoints WHERE thread_id = ?",
+                (str(thread_id),),
+            )
+            cur.execute(
+                "DELETE FROM writes WHERE thread_id = ?",
+                (str(thread_id),),
+            )
+
+    def get_delta_channel_history(
+        self, *, config: RunnableConfig, channels: Sequence[str]
+    ) -> Mapping[str, DeltaChannelHistory]:
+        """Fast-path override of `BaseCheckpointSaver.get_delta_channel_history`.
+
+        Two-stage query:
+
+        * Stage 1 (paged): newest-first slice of `checkpoints` returning
+          `(checkpoint_id, parent_checkpoint_id, type, checkpoint)` per
+          ancestor. Sqlite has no JSONB, so we ship the full serialized
+          checkpoint blob and inspect `channel_values` in Python. Pages
+          newest-first by `checkpoint_id` with a `< cursor` predicate;
+          page size is `DELTA_PAGE_SIZE`. Stops paging when every channel
+          has found its seed or the chain is exhausted.
+
+        * Stage 2 (per-channel UNION ALL): one branch per channel reading
+          `writes` filtered to that channel's specific `chain_cids`. No
+          separate seed-blob fetch — sqlite stores `channel_values` inline
+          in the checkpoint blob, so seeds come back from stage 1.
+        """
+        if not channels:
+            return {}
+        channels = list(channels)
+        thread_id = str(config["configurable"]["thread_id"])
+        checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
+        checkpoint_id = get_checkpoint_id(config)
+        if checkpoint_id is None:
+            target = self.get_tuple(config)
+            if target is None:
+                return {ch: {"writes": []} for ch in channels}
+            checkpoint_id = target.config["configurable"]["checkpoint_id"]
+
+        chain_by_ch: dict[str, list[str]] = {ch: [] for ch in channels}
+        seed_val_by_ch: dict[str, Any] = {}
+        walk_state: dict[str, Any] = {}
+        seeded: set[str] = set()
+
+        with self.cursor(transaction=False) as cur:
+            cur.execute(DELTA_STAGE1_SQL, (thread_id, checkpoint_ns, checkpoint_id))
+            for row in cur:
+                cid, parent_cid, type_tag, blob = row
+                if step_walk_with_row(
+                    cid=cid,
+                    parent_cid=parent_cid,
+                    type_tag=type_tag,
+                    blob=blob,
+                    target_id=checkpoint_id,
+                    serde=self.serde,
+                    chain_by_ch=chain_by_ch,
+                    seed_val_by_ch=seed_val_by_ch,
+                    walk_state=walk_state,
+                    seeded=seeded,
+                    channels=channels,
+                ):
+                    break
+
+            channels_with_chain = [ch for ch in channels if chain_by_ch[ch]]
+            stage2_sql = build_delta_stage2_sql(
+                chain_lens=[len(chain_by_ch[ch]) for ch in channels_with_chain],
+            )
+            if stage2_sql:
+                stage2_params: list[Any] = []
+                for ch in channels_with_chain:
+                    stage2_params.extend(
+                        [thread_id, checkpoint_ns, ch, *chain_by_ch[ch]]
+                    )
+                cur.execute(stage2_sql, stage2_params)
+                stage2_rows = cast(
+                    "list[tuple[str, str, str, int, str, bytes]]", cur.fetchall()
+                )
+            else:
+                stage2_rows = []
+
+        return build_delta_channels_writes_history(
+            channels=channels,
+            chain_by_ch=chain_by_ch,
+            seed_val_by_ch=seed_val_by_ch,
+            seeded=seeded,
+            stage2_rows=stage2_rows,
+            serde=self.serde,
+        )
+
+    async def aget_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
         """Get a checkpoint tuple from the database asynchronously.
 
         Note:
@@ -469,11 +593,11 @@ class SqliteSaver(BaseCheckpointSaver[str]):
 
     async def alist(
         self,
-        config: Optional[RunnableConfig],
+        config: RunnableConfig | None,
         *,
-        filter: Optional[Dict[str, Any]] = None,
-        before: Optional[RunnableConfig] = None,
-        limit: Optional[int] = None,
+        filter: dict[str, Any] | None = None,
+        before: RunnableConfig | None = None,
+        limit: int | None = None,
     ) -> AsyncIterator[CheckpointTuple]:
         """List checkpoints from the database asynchronously.
 
@@ -499,14 +623,13 @@ class SqliteSaver(BaseCheckpointSaver[str]):
         """
         raise NotImplementedError(_AIO_ERROR_MSG)
 
-    def get_next_version(self, current: Optional[str], channel: ChannelProtocol) -> str:
+    def get_next_version(self, current: str | None, channel: None) -> str:
         """Generate the next version ID for a channel.
 
         This method creates a new version identifier for a channel based on its current version.
 
         Args:
             current (Optional[str]): The current version identifier of the channel.
-            channel (BaseChannel): The channel being versioned.
 
         Returns:
             str: The next version identifier, which is guaranteed to be monotonically increasing.

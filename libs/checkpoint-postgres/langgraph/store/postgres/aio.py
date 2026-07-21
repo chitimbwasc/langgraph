@@ -1,15 +1,13 @@
+from __future__ import annotations
+
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Iterable, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from contextlib import asynccontextmanager
-from typing import Any, Callable, Optional, Union, cast
+from types import TracebackType
+from typing import Any, cast
 
 import orjson
-from psycopg import AsyncConnection, AsyncCursor, AsyncPipeline, Capabilities
-from psycopg.rows import DictRow, dict_row
-from psycopg_pool import AsyncConnectionPool
-
-from langgraph.checkpoint.postgres import _ainternal
 from langgraph.store.base import (
     GetOp,
     ListNamespacesOp,
@@ -19,12 +17,18 @@ from langgraph.store.base import (
     SearchOp,
 )
 from langgraph.store.base.batch import AsyncBatchedBaseStore
+from psycopg import AsyncConnection, AsyncCursor, AsyncPipeline, Capabilities
+from psycopg.rows import DictRow, dict_row
+from psycopg_pool import AsyncConnectionPool
+
+from langgraph.checkpoint.postgres import _ainternal
 from langgraph.store.postgres.base import (
-    _PLACEHOLDER,
+    PLACEHOLDER,
     BasePostgresStore,
     PoolConfig,
     PostgresIndexConfig,
     Row,
+    TTLConfig,
     _decode_ns_bytes,
     _ensure_index_config,
     _group_ops,
@@ -76,7 +80,7 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
             await store.aput(("docs",), "doc3", {"text": "Other guide"}, index=False)  # don't index
 
             # Search by similarity
-            results = await store.asearch(("docs",), "programming guides", limit=2)
+            results = await store.asearch(("docs",), query="programming guides", limit=2)
         ```
 
         Using connection pooling for better performance:
@@ -106,6 +110,11 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
         Semantic search is disabled by default. You can enable it by providing an `index` configuration
         when creating the store. Without this configuration, all `index` arguments passed to
         `put` or `aput` will have no effect.
+
+    Note:
+        If you provide a TTL configuration, you must explicitly call `start_ttl_sweeper()` to begin
+        the background task that removes expired items. Call `stop_ttl_sweeper()` to properly
+        clean up resources when you're done with the store.
     """
 
     __slots__ = (
@@ -115,17 +124,20 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
         "supports_pipeline",
         "index_config",
         "embeddings",
+        "ttl_config",
+        "_ttl_sweeper_task",
+        "_ttl_stop_event",
     )
+    supports_ttl: bool = True
 
     def __init__(
         self,
         conn: _ainternal.Conn,
         *,
-        pipe: Optional[AsyncPipeline] = None,
-        deserializer: Optional[
-            Callable[[Union[bytes, orjson.Fragment]], dict[str, Any]]
-        ] = None,
-        index: Optional[PostgresIndexConfig] = None,
+        pipe: AsyncPipeline | None = None,
+        deserializer: Callable[[bytes | orjson.Fragment], dict[str, Any]] | None = None,
+        index: PostgresIndexConfig | None = None,
+        ttl: TTLConfig | None = None,
     ) -> None:
         if isinstance(conn, AsyncConnectionPool) and pipe is not None:
             raise ValueError(
@@ -141,20 +153,22 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
         self.index_config = index
         if self.index_config:
             self.embeddings, self.index_config = _ensure_index_config(self.index_config)
-
         else:
             self.embeddings = None
+
+        self.ttl_config = ttl
+        self._ttl_sweeper_task: asyncio.Task[None] | None = None
+        self._ttl_stop_event = asyncio.Event()
 
     async def abatch(self, ops: Iterable[Op]) -> list[Result]:
         grouped_ops, num_ops = _group_ops(ops)
         results: list[Result] = [None] * num_ops
 
-        async with _ainternal.get_connection(self.conn) as conn:
-            if self.pipe:
-                async with self.pipe:
-                    await self._execute_batch(grouped_ops, results, conn)
-            else:
-                await self._execute_batch(grouped_ops, results, conn)
+        if self.pipe:
+            async with self.pipe:
+                await self._execute_batch(grouped_ops, results)
+        else:
+            await self._execute_batch(grouped_ops, results)
 
         return results
 
@@ -165,18 +179,19 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
         conn_string: str,
         *,
         pipeline: bool = False,
-        pool_config: Optional[PoolConfig] = None,
-        index: Optional[PostgresIndexConfig] = None,
-    ) -> AsyncIterator["AsyncPostgresStore"]:
+        pool_config: PoolConfig | None = None,
+        index: PostgresIndexConfig | None = None,
+        ttl: TTLConfig | None = None,
+    ) -> AsyncIterator[AsyncPostgresStore]:
         """Create a new AsyncPostgresStore instance from a connection string.
 
         Args:
-            conn_string (str): The Postgres connection info string.
-            pipeline (bool): Whether to use AsyncPipeline (only for single connections)
-            pool_config (Optional[PoolConfig]): Configuration for the connection pool.
+            conn_string: The Postgres connection info string.
+            pipeline: Whether to use AsyncPipeline (only for single connections)
+            pool_config: Configuration for the connection pool.
                 If provided, will create a connection pool and use it instead of a single connection.
                 This overrides the `pipeline` argument.
-            index (Optional[PostgresIndexConfig]): The embedding config.
+            index: The embedding config.
 
         Returns:
             AsyncPostgresStore: A new AsyncPostgresStore instance.
@@ -198,16 +213,16 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
                     **cast(dict, pc),
                 ),
             ) as pool:
-                yield cls(conn=pool, index=index)
+                yield cls(conn=pool, index=index, ttl=ttl)
         else:
             async with await AsyncConnection.connect(
                 conn_string, autocommit=True, prepare_threshold=0, row_factory=dict_row
             ) as conn:
                 if pipeline:
                     async with conn.pipeline() as pipe:
-                        yield cls(conn=conn, pipe=pipe, index=index)
+                        yield cls(conn=conn, pipe=pipe, index=index, ttl=ttl)
                 else:
-                    yield cls(conn=conn, index=index)
+                    yield cls(conn=conn, index=index, ttl=ttl)
 
     async def setup(self) -> None:
         """Set up the store database asynchronously.
@@ -250,18 +265,154 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
                             k: v(self) if v is not None and callable(v) else v
                             for k, v in migration.params.items()
                         }
+                        if "dims" in params:
+                            try:
+                                params["dims"] = int(params["dims"])
+                            except Exception as e:
+                                raise ValueError(
+                                    f"Invalid dims for vector index: {params['dims']}"
+                                ) from e
+                        if "vector_type" in params:
+                            vt = str(params["vector_type"])
+                            if vt not in ("vector", "halfvec"):
+                                raise ValueError(
+                                    f"Invalid vector_type for pgvector: {vt}"
+                                )
+                            params["vector_type"] = vt
+                        if "index_type" in params:
+                            it = str(params["index_type"])
+                            if it not in ("hnsw", "ivfflat"):
+                                raise ValueError(
+                                    f"Invalid index_type for pgvector: {it}"
+                                )
+                            params["index_type"] = it
                         sql = sql % params
                     await cur.execute(sql)
                     await cur.execute(
                         "INSERT INTO vector_migrations (v) VALUES (%s)", (v,)
                     )
 
+    async def sweep_ttl(self) -> int:
+        """Delete expired store items based on TTL.
+
+        Returns:
+            int: The number of deleted items.
+        """
+        async with self._cursor() as cur:
+            await cur.execute(
+                """
+                DELETE FROM store
+                WHERE expires_at IS NOT NULL AND expires_at < NOW()
+                """
+            )
+            deleted_count = cur.rowcount
+            return deleted_count
+
+    async def start_ttl_sweeper(
+        self, sweep_interval_minutes: int | None = None
+    ) -> asyncio.Task[None]:
+        """Periodically delete expired store items based on TTL.
+
+        Returns:
+            Task that can be awaited or cancelled.
+        """
+        if not self.ttl_config:
+            return asyncio.create_task(asyncio.sleep(0))
+
+        if self._ttl_sweeper_task is not None and not self._ttl_sweeper_task.done():
+            return self._ttl_sweeper_task
+
+        self._ttl_stop_event.clear()
+
+        interval = float(
+            sweep_interval_minutes or self.ttl_config.get("sweep_interval_minutes") or 5
+        )
+        logger.info(f"Starting store TTL sweeper with interval {interval} minutes")
+
+        async def _sweep_loop() -> None:
+            while not self._ttl_stop_event.is_set():
+                try:
+                    try:
+                        await asyncio.wait_for(
+                            self._ttl_stop_event.wait(),
+                            timeout=interval * 60,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+
+                    expired_items = await self.sweep_ttl()
+                    if expired_items > 0:
+                        logger.info(f"Store swept {expired_items} expired items")
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    logger.exception("Store TTL sweep iteration failed", exc_info=exc)
+
+        task = asyncio.create_task(_sweep_loop())
+        task.set_name("ttl_sweeper")
+        self._ttl_sweeper_task = task
+        return task
+
+    async def stop_ttl_sweeper(self, timeout: float | None = None) -> bool:
+        """Stop the TTL sweeper task if it's running.
+
+        Args:
+            timeout: Maximum time to wait for the task to stop, in seconds.
+                If `None`, wait indefinitely.
+
+        Returns:
+            bool: True if the task was successfully stopped or wasn't running,
+                False if the timeout was reached before the task stopped.
+        """
+        if self._ttl_sweeper_task is None or self._ttl_sweeper_task.done():
+            return True
+
+        logger.info("Stopping TTL sweeper task")
+        self._ttl_stop_event.set()
+
+        if timeout is not None:
+            try:
+                await asyncio.wait_for(self._ttl_sweeper_task, timeout=timeout)
+                success = True
+            except asyncio.TimeoutError:
+                success = False
+        else:
+            await self._ttl_sweeper_task
+            success = True
+
+        if success:
+            self._ttl_sweeper_task = None
+            logger.info("TTL sweeper task stopped")
+        else:
+            logger.warning("Timed out waiting for TTL sweeper task to stop")
+
+        return success
+
+    async def __aenter__(self) -> AsyncPostgresStore:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        # Ensure the TTL sweeper task is stopped when exiting the context
+        if hasattr(self, "_ttl_sweeper_task") and self._ttl_sweeper_task is not None:
+            # Set the event to signal the task to stop
+            self._ttl_stop_event.set()
+            # We don't wait for the task to complete here to avoid blocking
+            # The task will clean up itself gracefully
+
     async def _execute_batch(
         self,
         grouped_ops: dict,
         results: list[Result],
-        conn: AsyncConnection[DictRow],
+        conn: AsyncConnection[DictRow] | None = None,
     ) -> None:
+        # Keep `conn` for compatibility with subclasses overriding this private hook.
+        # All database I/O goes through `_cursor()`, which owns connection acquisition.
         async with self._cursor(pipeline=True) as cur:
             if GetOp in grouped_ops:
                 await self._batch_get_ops(
@@ -336,7 +487,9 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
                     query,
                     [
                         p
-                        for (ns, k, pathname, _), vector in zip(txt_params, vectors)
+                        for (ns, k, pathname, _), vector in zip(
+                            txt_params, vectors, strict=False
+                        )
                         for p in (ns, k, pathname, vector)
                     ],
                 )
@@ -357,13 +510,13 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
             vectors = await self.embeddings.aembed_documents(
                 [query for _, query in embedding_requests]
             )
-            for (idx, _), vector in zip(embedding_requests, vectors):
+            for (idx, _), vector in zip(embedding_requests, vectors, strict=False):
                 _paramslist = queries[idx][1]
                 for i in range(len(_paramslist)):
-                    if _paramslist[i] is _PLACEHOLDER:
+                    if _paramslist[i] is PLACEHOLDER:
                         _paramslist[i] = vector
 
-        for (idx, _), (query, params) in zip(search_ops, queries):
+        for (idx, _), (query, params) in zip(search_ops, queries, strict=False):
             await cur.execute(query, params)
             rows = cast(list[Row], await cur.fetchall())
             items = [
@@ -381,7 +534,7 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
         cur: AsyncCursor[DictRow],
     ) -> None:
         queries = self._get_batch_list_namespaces_queries(list_ops)
-        for (query, params), (idx, _) in zip(queries, list_ops):
+        for (query, params), (idx, _) in zip(queries, list_ops, strict=False):
             await cur.execute(query, params)
             rows = cast(list[dict], await cur.fetchall())
             namespaces = [_decode_ns_bytes(row["truncated_prefix"]) for row in rows]
@@ -398,6 +551,11 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
                 Will be applied regardless of whether the PostgresStore instance was initialized with a pipeline.
                 If pipeline mode is not supported, will fall back to using transaction context manager.
         """
+        is_pooled_conn = isinstance(self.conn, AsyncConnectionPool)
+        # With AsyncConnectionPool, each _cursor() call checks out its own connection.
+        # The pool does not hand out the same connection concurrently, so a shared lock
+        # across calls is unnecessary here.
+        lock = asyncio.Lock() if is_pooled_conn else self.lock
         async with _ainternal.get_connection(self.conn) as conn:
             if self.pipe:
                 # a connection in pipeline mode can be used concurrently
@@ -414,21 +572,21 @@ class AsyncPostgresStore(AsyncBatchedBaseStore, BasePostgresStore[_ainternal.Con
                 # thread/coroutine at a time, so we acquire a lock
                 if self.supports_pipeline:
                     async with (
-                        self.lock,
+                        lock,
                         conn.pipeline(),
                         conn.cursor(binary=True, row_factory=dict_row) as cur,
                     ):
                         yield cur
                 else:
                     async with (
-                        self.lock,
+                        lock,
                         conn.transaction(),
                         conn.cursor(binary=True, row_factory=dict_row) as cur,
                     ):
                         yield cur
             else:
                 async with (
-                    self.lock,
-                    conn.cursor(binary=True) as cur,
+                    lock,
+                    conn.cursor(binary=True, row_factory=dict_row) as cur,
                 ):
                     yield cur

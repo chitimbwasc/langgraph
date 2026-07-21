@@ -8,8 +8,8 @@ Note:
     All typing.TypedDict classes use total=False to make all fields typing.Optional by default.
 """
 
-import functools
-import sys
+from __future__ import annotations
+
 import typing
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -55,36 +55,54 @@ Values:
     - reject: Reject the operation
 """
 
-FilterType = typing.Union[
-    typing.Dict[
-        str, typing.Union[str, typing.Dict[typing.Literal["$eq", "$contains"], str]]
-    ],
-    typing.Dict[str, str],
-]
+FilterType = (
+    dict[
+        str,
+        str
+        | dict[typing.Literal["$eq", "$contains"], str]
+        | dict[typing.Literal["$contains"], list[str]],
+    ]
+    | dict[str, str]
+)
 """Response type for authorization handlers.
 
 Supports exact matches and operators:
     - Exact match shorthand: {"field": "value"}
     - Exact match: {"field": {"$eq": "value"}}
-    - Contains: {"field": {"$contains": "value"}}
+    - Contains (membership): {"field": {"$contains": "value"}}
+    - Contains (subset containment): {"field": {"$contains": ["value1", "value2"]}}
+
+Subset containment is only supported by newer versions of the LangGraph dev server;
+install langgraph-runtime-inmem >= 0.14.1 to use this filter variant.
 
 ???+ example "Examples"
+
     Simple exact match filter for the resource owner:
+
     ```python
     filter = {"owner": "user-abcd123"}
     ```
-    
+
     Explicit version of the exact match filter:
+
     ```python
     filter = {"owner": {"$eq": "user-abcd123"}}
     ```
-    
-    Containment:
+
+    Containment (membership of a single element):
+
     ```python
     filter = {"participants": {"$contains": "user-abcd123"}}
     ```
 
+    Containment (subset containment; all values must be present, but order doesn't matter):
+
+    ```python
+    filter = {"participants": {"$contains": ["user-abcd123", "user-efgh456"]}}
+    ```
+
     Combining filters (treated as a logical `AND`):
+
     ```python
     filter = {"owner": "user-abcd123", "participants": {"$contains": "user-efgh456"}}
     ```
@@ -100,13 +118,14 @@ Values:
     - error: Thread encountered an error
 """
 
-MetadataInput = typing.Dict[str, typing.Any]
+MetadataInput = dict[str, typing.Any]
 """Type for arbitrary metadata attached to entities.
 
 Allows storing custom key-value pairs with any entity.
 Keys must be strings, values can be any JSON-serializable type.
 
 ???+ example "Examples"
+
     ```python
     metadata = {
         "created_by": "user123",
@@ -116,7 +135,7 @@ Keys must be strings, values can be any JSON-serializable type.
     ```
 """
 
-HandlerResult = typing.Union[None, bool, FilterType]
+HandlerResult = None | bool | FilterType
 """The result of a handler can be:
     * None | True: accept the request.
     * False: reject the request with a 403 error
@@ -126,15 +145,6 @@ HandlerResult = typing.Union[None, bool, FilterType]
 Handler = Callable[..., Awaitable[HandlerResult]]
 
 T = typing.TypeVar("T")
-
-
-def _slotify(fn: T) -> T:
-    if sys.version_info >= (3, 10):  # noqa: UP036
-        return functools.partial(fn, slots=True)  # type: ignore
-    return fn
-
-
-dataclass = _slotify(dataclass)
 
 
 @typing.runtime_checkable
@@ -192,6 +202,18 @@ class BaseUser(typing.Protocol):
         """The permissions associated with the user."""
         ...
 
+    def __getitem__(self, key):
+        """Get a key from your minimal user dict."""
+        ...
+
+    def __contains__(self, key):
+        """Check if a property exists."""
+        ...
+
+    def __iter__(self):
+        """Iterate over the keys of the user."""
+        ...
+
 
 class StudioUser:
     """A user object that's populated from authenticated requests from the LangGraph studio.
@@ -210,17 +232,25 @@ class StudioUser:
     for developers accessing the instance from the LangGraph Studio UI.
 
     ???+ example "Examples"
+
+        Use `@auth.on` to deny by default, but allow Studio users through:
+
         ```python
         @auth.on
-        async def allow_developers(ctx: Auth.types.AuthContext, value: Any) -> None:
+        async def deny_all_except_studio(ctx: Auth.types.AuthContext, value: Any) -> bool:
+            # Allow Studio users, deny everyone else by default
             if isinstance(ctx.user, Auth.types.StudioUser):
-                return None
-            ...
+                return True
             return False
+
+        # Then add specific handlers to allow access for non-Studio users
+        @auth.on.threads
+        async def allow_thread_access(ctx: Auth.types.AuthContext, value: Any) -> Auth.types.FilterType:
+            return {"owner": ctx.user.identity}
         ```
     """
 
-    __slots__ = ("username", "_is_authenticated", "_permissions")
+    __slots__ = ("_is_authenticated", "_permissions", "username")
 
     def __init__(self, username: str, is_authenticated: bool = False) -> None:
         self.username = username
@@ -247,9 +277,11 @@ class StudioUser:
 Authenticator = Callable[
     ...,
     Awaitable[
-        typing.Union[
-            MinimalUser, str, BaseUser, MinimalUserDict, typing.Mapping[str, typing.Any]
-        ],
+        MinimalUser
+        | str
+        | BaseUser
+        | MinimalUserDict
+        | typing.Mapping[str, typing.Any],
     ],
 ]
 """Type for authentication functions.
@@ -276,7 +308,9 @@ Parameters:
     authorization (str | None): The Authorization header value (e.g. "Bearer <token>")
 
 ???+ example "Examples"
+
     Basic authentication with token:
+
     ```python
     from langgraph_sdk import Auth
 
@@ -288,6 +322,7 @@ Parameters:
     ```
 
     Authentication with multiple parameters:
+
     ```    
     @auth.authenticate
     async def authenticate2(
@@ -301,6 +336,7 @@ Parameters:
     ```
 
     Accepting the raw ASGI request:
+
     ```python
     MY_SECRET = "my-secret-key"
     @auth.authenticate
@@ -334,7 +370,7 @@ Parameters:
 """
 
 
-@dataclass
+@dataclass(slots=True)
 class BaseAuthContext:
     """Base class for authentication context.
 
@@ -350,7 +386,7 @@ class BaseAuthContext:
 
 
 @typing.final
-@dataclass
+@dataclass(slots=True)
 class AuthContext(BaseAuthContext):
     """Complete authentication context with resource and action information.
 
@@ -373,7 +409,7 @@ class AuthContext(BaseAuthContext):
         "list_namespaces",
     ]
     """The action being performed on the resource.
-    
+
     Most resources support the following actions:
     - create: Create a new resource
     - read: Read information about a resource
@@ -382,16 +418,33 @@ class AuthContext(BaseAuthContext):
     - search: Search for resources
 
     The store supports the following actions:
-    - put: Add or update a document in the store
-    - get: Get a document from the store
+    - put: Add or update an item in the store
+    - get: Get an item from the store
+    - search: Search for items within a namespace prefix
+    - delete: Delete an item from the store
     - list_namespaces: List the namespaces in the store
     """
+
+
+class ThreadTTL(typing.TypedDict, total=False):
+    """Time-to-live configuration for a thread.
+
+    Matches the OpenAPI schema where TTL is represented as an object with
+    an optional strategy and a time value in minutes.
+    """
+
+    strategy: typing.Literal["delete"]
+    """TTL strategy. Currently only 'delete' is supported."""
+
+    ttl: int
+    """Time-to-live in minutes from now until the thread should be swept."""
 
 
 class ThreadsCreate(typing.TypedDict, total=False):
     """Parameters for creating a new thread.
 
     ???+ example "Examples"
+
         ```python
         create_params = {
             "thread_id": UUID("123e4567-e89b-12d3-a456-426614174000"),
@@ -410,6 +463,9 @@ class ThreadsCreate(typing.TypedDict, total=False):
     if_exists: OnConflictBehavior
     """Behavior when a thread with the same ID already exists."""
 
+    ttl: ThreadTTL
+    """Optional TTL configuration for the thread."""
+
 
 class ThreadsRead(typing.TypedDict, total=False):
     """Parameters for reading thread state or run information.
@@ -422,7 +478,7 @@ class ThreadsRead(typing.TypedDict, total=False):
     thread_id: UUID
     """Unique identifier for the thread."""
 
-    run_id: typing.Optional[UUID]
+    run_id: UUID | None
     """Run ID to filter by. Only used when reading run information within a thread."""
 
 
@@ -439,7 +495,7 @@ class ThreadsUpdate(typing.TypedDict, total=False):
     metadata: MetadataInput
     """typing.Optional metadata to update."""
 
-    action: typing.Optional[typing.Literal["interrupt", "rollback"]]
+    action: typing.Literal["interrupt", "rollback"] | None
     """typing.Optional action to perform on the thread."""
 
 
@@ -452,7 +508,7 @@ class ThreadsDelete(typing.TypedDict, total=False):
     thread_id: UUID
     """Unique identifier for the thread."""
 
-    run_id: typing.Optional[UUID]
+    run_id: UUID | None
     """typing.Optional run ID to filter by."""
 
 
@@ -468,7 +524,7 @@ class ThreadsSearch(typing.TypedDict, total=False):
     values: MetadataInput
     """typing.Optional values to filter by."""
 
-    status: typing.Optional[ThreadStatus]
+    status: ThreadStatus | None
     """typing.Optional status to filter by."""
 
     limit: int
@@ -477,7 +533,10 @@ class ThreadsSearch(typing.TypedDict, total=False):
     offset: int
     """Offset for pagination."""
 
-    thread_id: typing.Optional[UUID]
+    ids: Sequence[UUID] | None
+    """typing.Optional list of thread IDs to filter by."""
+
+    thread_id: UUID | None
     """typing.Optional thread ID to filter by."""
 
 
@@ -485,6 +544,7 @@ class RunsCreate(typing.TypedDict, total=False):
     """Payload for creating a run.
 
     ???+ example "Examples"
+
         ```python
         create_params = {
             "assistant_id": UUID("123e4567-e89b-12d3-a456-426614174000"),
@@ -502,16 +562,16 @@ class RunsCreate(typing.TypedDict, total=False):
         ```
     """
 
-    assistant_id: typing.Optional[UUID]
+    assistant_id: UUID | None
     """typing.Optional assistant ID to use for this run."""
 
-    thread_id: typing.Optional[UUID]
+    thread_id: UUID | None
     """typing.Optional thread ID to use for this run."""
 
-    run_id: typing.Optional[UUID]
+    run_id: UUID | None
     """typing.Optional run ID to use for this run."""
 
-    status: typing.Optional[RunStatus]
+    status: RunStatus | None
     """typing.Optional status for this run."""
 
     metadata: MetadataInput
@@ -529,10 +589,10 @@ class RunsCreate(typing.TypedDict, total=False):
     after_seconds: int
     """Number of seconds to wait before creating the run."""
 
-    kwargs: typing.Dict[str, typing.Any]
+    kwargs: dict[str, typing.Any]
     """Keyword arguments to pass to the run."""
 
-    action: typing.Optional[typing.Literal["interrupt", "rollback"]]
+    action: typing.Literal["interrupt", "rollback"] | None
     """Action to take if updating an existing run."""
 
 
@@ -540,11 +600,13 @@ class AssistantsCreate(typing.TypedDict, total=False):
     """Payload for creating an assistant.
 
     ???+ example "Examples"
+
         ```python
         create_params = {
             "assistant_id": UUID("123e4567-e89b-12d3-a456-426614174000"),
             "graph_id": "graph123",
-            "config": {"key": "value"},
+            "config": {"tags": ["tag1", "tag2"]},
+            "context": {"key": "value"},
             "metadata": {"owner": "user123"},
             "if_exists": "do_nothing",
             "name": "Assistant 1"
@@ -558,8 +620,10 @@ class AssistantsCreate(typing.TypedDict, total=False):
     graph_id: str
     """Graph ID to use for this assistant."""
 
-    config: typing.Optional[typing.Union[typing.Dict[str, typing.Any], typing.Any]]
+    config: dict[str, typing.Any]
     """typing.Optional configuration for the assistant."""
+
+    context: dict[str, typing.Any]
 
     metadata: MetadataInput
     """typing.Optional metadata to attach to the assistant."""
@@ -575,6 +639,7 @@ class AssistantsRead(typing.TypedDict, total=False):
     """Payload for reading an assistant.
 
     ???+ example "Examples"
+
         ```python
         read_params = {
             "assistant_id": UUID("123e4567-e89b-12d3-a456-426614174000"),
@@ -594,11 +659,13 @@ class AssistantsUpdate(typing.TypedDict, total=False):
     """Payload for updating an assistant.
 
     ???+ example "Examples"
+
         ```python
         update_params = {
             "assistant_id": UUID("123e4567-e89b-12d3-a456-426614174000"),
             "graph_id": "graph123",
-            "config": {"key": "value"},
+            "config": {"tags": ["tag1", "tag2"]},
+            "context": {"key": "value"},
             "metadata": {"owner": "user123"},
             "name": "Assistant 1",
             "version": 1
@@ -609,19 +676,22 @@ class AssistantsUpdate(typing.TypedDict, total=False):
     assistant_id: UUID
     """Unique identifier for the assistant."""
 
-    graph_id: typing.Optional[str]
+    graph_id: str | None
     """typing.Optional graph ID to update."""
 
-    config: typing.Optional[typing.Union[typing.Dict[str, typing.Any], typing.Any]]
+    config: dict[str, typing.Any]
     """typing.Optional configuration to update."""
+
+    context: dict[str, typing.Any]
+    """The static context of the assistant."""
 
     metadata: MetadataInput
     """typing.Optional metadata to update."""
 
-    name: typing.Optional[str]
+    name: str | None
     """typing.Optional name to update."""
 
-    version: typing.Optional[int]
+    version: int | None
     """typing.Optional version to update."""
 
 
@@ -629,6 +699,7 @@ class AssistantsDelete(typing.TypedDict):
     """Payload for deleting an assistant.
 
     ???+ example "Examples"
+
         ```python
         delete_params = {
             "assistant_id": UUID("123e4567-e89b-12d3-a456-426614174000")
@@ -644,6 +715,7 @@ class AssistantsSearch(typing.TypedDict):
     """Payload for searching assistants.
 
     ???+ example "Examples"
+
         ```python
         search_params = {
             "graph_id": "graph123",
@@ -654,7 +726,7 @@ class AssistantsSearch(typing.TypedDict):
         ```
     """
 
-    graph_id: typing.Optional[str]
+    graph_id: str | None
     """typing.Optional graph ID to filter by."""
 
     metadata: MetadataInput
@@ -671,6 +743,7 @@ class CronsCreate(typing.TypedDict, total=False):
     """Payload for creating a cron job.
 
     ???+ example "Examples"
+
         ```python
         create_params = {
             "payload": {"key": "value"},
@@ -683,22 +756,22 @@ class CronsCreate(typing.TypedDict, total=False):
         ```
     """
 
-    payload: typing.Dict[str, typing.Any]
+    payload: dict[str, typing.Any]
     """Payload for the cron job."""
 
     schedule: str
     """Schedule for the cron job."""
 
-    cron_id: typing.Optional[UUID]
+    cron_id: UUID | None
     """typing.Optional unique identifier for the cron job."""
 
-    thread_id: typing.Optional[UUID]
+    thread_id: UUID | None
     """typing.Optional thread ID to use for this cron job."""
 
-    user_id: typing.Optional[str]
+    user_id: str | None
     """typing.Optional user ID to use for this cron job."""
 
-    end_time: typing.Optional[datetime]
+    end_time: datetime | None
     """typing.Optional end time for the cron job."""
 
 
@@ -706,6 +779,7 @@ class CronsDelete(typing.TypedDict):
     """Payload for deleting a cron job.
 
     ???+ example "Examples"
+
         ```python
         delete_params = {
             "cron_id": UUID("123e4567-e89b-12d3-a456-426614174000")
@@ -721,6 +795,7 @@ class CronsRead(typing.TypedDict):
     """Payload for reading a cron job.
 
     ???+ example "Examples"
+
         ```python
         read_params = {
             "cron_id": UUID("123e4567-e89b-12d3-a456-426614174000")
@@ -736,6 +811,7 @@ class CronsUpdate(typing.TypedDict, total=False):
     """Payload for updating a cron job.
 
     ???+ example "Examples"
+
         ```python
         update_params = {
             "cron_id": UUID("123e4567-e89b-12d3-a456-426614174000"),
@@ -748,10 +824,10 @@ class CronsUpdate(typing.TypedDict, total=False):
     cron_id: UUID
     """Unique identifier for the cron job."""
 
-    payload: typing.Optional[typing.Dict[str, typing.Any]]
+    payload: dict[str, typing.Any] | None
     """typing.Optional payload to update."""
 
-    schedule: typing.Optional[str]
+    schedule: str | None
     """typing.Optional schedule to update."""
 
 
@@ -759,6 +835,7 @@ class CronsSearch(typing.TypedDict, total=False):
     """Payload for searching cron jobs.
 
     ???+ example "Examples"
+
         ```python
         search_params = {
             "assistant_id": UUID("123e4567-e89b-12d3-a456-426614174000"),
@@ -769,10 +846,10 @@ class CronsSearch(typing.TypedDict, total=False):
         ```
     """
 
-    assistant_id: typing.Optional[UUID]
+    assistant_id: UUID | None
     """typing.Optional assistant ID to filter by."""
 
-    thread_id: typing.Optional[UUID]
+    thread_id: UUID | None
     """typing.Optional thread ID to filter by."""
 
     limit: int
@@ -783,22 +860,36 @@ class CronsSearch(typing.TypedDict, total=False):
 
 
 class StoreGet(typing.TypedDict):
-    """Operation to retrieve a specific item by its namespace and key."""
+    """Operation to retrieve a specific item by its namespace and key.
+
+    This dict is mutable — auth handlers can modify `namespace` to enforce
+    access scoping (e.g., prepending the user's identity).
+    """
 
     namespace: tuple[str, ...]
-    """Hierarchical path that uniquely identifies the item's location."""
+    """Hierarchical path that uniquely identifies the item's location.
+
+    Auth handlers can modify this to enforce per-user scoping.
+    """
 
     key: str
     """Unique identifier for the item within its specific namespace."""
 
 
 class StoreSearch(typing.TypedDict):
-    """Operation to search for items within a specified namespace hierarchy."""
+    """Operation to search for items within a specified namespace hierarchy.
+
+    This dict is mutable — auth handlers can modify `namespace` to enforce
+    access scoping (e.g., prepending the user's identity).
+    """
 
     namespace: tuple[str, ...]
-    """Prefix filter for defining the search scope."""
+    """Prefix filter for defining the search scope.
 
-    filter: typing.Optional[dict[str, typing.Any]]
+    Auth handlers can modify this to enforce per-user scoping.
+    """
+
+    filter: dict[str, typing.Any] | None
     """Key-value pairs for filtering results based on exact matches or comparison operators."""
 
     limit: int
@@ -807,20 +898,28 @@ class StoreSearch(typing.TypedDict):
     offset: int
     """Number of matching items to skip for pagination."""
 
-    query: typing.Optional[str]
-    """Naturalj language search query for semantic search capabilities."""
+    query: str | None
+    """Natural language search query for semantic search capabilities."""
 
 
 class StoreListNamespaces(typing.TypedDict):
-    """Operation to list and filter namespaces in the store."""
+    """Operation to list and filter namespaces in the store.
 
-    namespace: typing.Optional[tuple[str, ...]]
-    """Prefix filter namespaces."""
+    This dict is mutable — auth handlers can modify `namespace` (the prefix)
+    to enforce access scoping (e.g., prepending the user's identity).
+    """
 
-    suffix: typing.Optional[tuple[str, ...]]
+    namespace: tuple[str, ...] | None
+    """Prefix filter for namespaces. Can be `None` if no prefix was provided.
+
+    Auth handlers can modify this to enforce per-user scoping. When `None`,
+    handlers should set it to `(user_id,)` to scope listing to the user's namespaces.
+    """
+
+    suffix: tuple[str, ...] | None
     """Optional conditions for filtering namespaces."""
 
-    max_depth: typing.Optional[int]
+    max_depth: int | None
     """Maximum depth of namespace hierarchy to return.
 
     Note:
@@ -835,26 +934,40 @@ class StoreListNamespaces(typing.TypedDict):
 
 
 class StorePut(typing.TypedDict):
-    """Operation to store, update, or delete an item in the store."""
+    """Operation to store, update, or delete an item in the store.
+
+    This dict is mutable — auth handlers can modify `namespace` to enforce
+    access scoping (e.g., prepending the user's identity).
+    """
 
     namespace: tuple[str, ...]
-    """Hierarchical path that identifies the location of the item."""
+    """Hierarchical path that identifies the location of the item.
+
+    Auth handlers can modify this to enforce per-user scoping.
+    """
 
     key: str
     """Unique identifier for the item within its namespace."""
 
-    value: typing.Optional[dict[str, typing.Any]]
-    """The data to store, or None to mark the item for deletion."""
+    value: dict[str, typing.Any] | None
+    """The data to store, or `None` to mark the item for deletion."""
 
-    index: typing.Optional[typing.Union[typing.Literal[False], list[str]]]
+    index: typing.Literal[False] | list[str] | None
     """Optional index configuration for full-text search."""
 
 
 class StoreDelete(typing.TypedDict):
-    """Operation to delete an item from the store."""
+    """Operation to delete an item from the store.
+
+    This dict is mutable — auth handlers can modify `namespace` to enforce
+    access scoping (e.g., prepending the user's identity).
+    """
 
     namespace: tuple[str, ...]
-    """Hierarchical path that uniquely identifies the item's location."""
+    """Hierarchical path that uniquely identifies the item's location.
+
+    Auth handlers can modify this to enforce per-user scoping.
+    """
 
     key: str
     """Unique identifier for the item within its specific namespace."""
@@ -867,35 +980,38 @@ class on:
     and search operations across different resources (threads, assistants, crons).
 
     ???+ note "Usage"
+        Start by denying all requests by default, then add handlers to allow access:
+
         ```python
         from langgraph_sdk import Auth
 
         auth = Auth()
 
+        # Default deny: reject all requests without a specific handler
         @auth.on
-        def handle_all(params: Auth.on.value):
-            raise Exception("Not authorized")
+        async def deny_all(ctx: Auth.types.AuthContext, value: Auth.on.value):
+            return False
 
+        # Allow thread creation, stamping the owner
         @auth.on.threads.create
-        def handle_thread_create(params: Auth.on.threads.create.value):
-            # Handle thread creation
-            pass
+        async def allow_thread_create(ctx: Auth.types.AuthContext, value: Auth.on.threads.create.value):
+            value.setdefault("metadata", {})["owner"] = ctx.user.identity
 
+        # Allow assistant search, scoped to user's resources
         @auth.on.assistants.search
-        def handle_assistant_search(params: Auth.on.assistants.search.value):
-            # Handle assistant search
-            pass
+        async def allow_assistant_search(ctx: Auth.types.AuthContext, value: Auth.on.assistants.search.value):
+            return {"owner": ctx.user.identity}
         ```
     """
 
-    value = typing.Dict[str, typing.Any]
+    value = dict[str, typing.Any]
 
     class threads:
         """Types for thread-related operations."""
 
-        value = typing.Union[
-            ThreadsCreate, ThreadsRead, ThreadsUpdate, ThreadsDelete, ThreadsSearch
-        ]
+        value = (
+            ThreadsCreate | ThreadsRead | ThreadsUpdate | ThreadsDelete | ThreadsSearch
+        )
 
         class create:
             """Type for thread creation parameters."""
@@ -930,13 +1046,13 @@ class on:
     class assistants:
         """Types for assistant-related operations."""
 
-        value = typing.Union[
-            AssistantsCreate,
-            AssistantsRead,
-            AssistantsUpdate,
-            AssistantsDelete,
-            AssistantsSearch,
-        ]
+        value = (
+            AssistantsCreate
+            | AssistantsRead
+            | AssistantsUpdate
+            | AssistantsDelete
+            | AssistantsSearch
+        )
 
         class create:
             """Type for assistant creation parameters."""
@@ -966,9 +1082,7 @@ class on:
     class crons:
         """Types for cron-related operations."""
 
-        value = typing.Union[
-            CronsCreate, CronsRead, CronsUpdate, CronsDelete, CronsSearch
-        ]
+        value = CronsCreate | CronsRead | CronsUpdate | CronsDelete | CronsSearch
 
         class create:
             """Type for cron creation parameters."""
@@ -998,9 +1112,7 @@ class on:
     class store:
         """Types for store-related operations."""
 
-        value = typing.Union[
-            StoreGet, StoreSearch, StoreListNamespaces, StorePut, StoreDelete
-        ]
+        value = StoreGet | StoreSearch | StoreListNamespaces | StorePut | StoreDelete
 
         class put:
             """Type for store put parameters."""
@@ -1029,22 +1141,22 @@ class on:
 
 
 __all__ = [
-    "on",
+    "AssistantsCreate",
+    "AssistantsDelete",
+    "AssistantsRead",
+    "AssistantsSearch",
+    "AssistantsUpdate",
     "MetadataInput",
     "RunsCreate",
-    "ThreadsCreate",
-    "ThreadsRead",
-    "ThreadsUpdate",
-    "ThreadsDelete",
-    "ThreadsSearch",
-    "AssistantsCreate",
-    "AssistantsRead",
-    "AssistantsUpdate",
-    "AssistantsDelete",
-    "AssistantsSearch",
+    "StoreDelete",
     "StoreGet",
-    "StoreSearch",
     "StoreListNamespaces",
     "StorePut",
-    "StoreDelete",
+    "StoreSearch",
+    "ThreadsCreate",
+    "ThreadsDelete",
+    "ThreadsRead",
+    "ThreadsSearch",
+    "ThreadsUpdate",
+    "on",
 ]
